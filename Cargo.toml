@@ -25,7 +25,10 @@ repository = "https://github.com/paltaio/rust-smb-server"
 smb-server = { path = ".", version = "0.4.1" }
 
 tokio = { version = "1.40", features = ["full"] }
-binrw = "0.15"
+# Floor is 0.15.2, not 0.15: 0.15.1 privately re-exports `extern crate binrw`, which
+# rustc E0365 is phasing out (rust-lang/rust#127909) — it makes consumers emit a
+# future-incompatibility warning. 0.15.2 fixes it.
+binrw = "0.15.2"
 bytes = "1.7"
 async-trait = "0.1"
 tracing = "0.1"
