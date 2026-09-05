@@ -54,4 +54,5 @@ pub mod wire {
 pub(crate) mod tests {
     mod dynamic_config;
     pub(crate) mod memfs;
+    mod set_info_allocation;
 }

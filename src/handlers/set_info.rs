@@ -147,8 +147,36 @@ pub async fn handle(
             }
         }
         ic::FILE_ALLOCATION_INFORMATION => {
-            // We don't preallocate; respond OK.
-            Ok(())
+            // FILE_ALLOCATION_INFORMATION (MS-FSCC §2.4.4) is a single 8-byte
+            // LARGE_INTEGER AllocationSize.
+            //
+            // We still don't preallocate, so raising the allocation stays a
+            // no-op. But the spec is explicit that lowering AllocationSize
+            // below the current EndOfFile MUST lower EndOfFile to it too —
+            // shrinking the allocation *is* a truncate. Acknowledging that
+            // with STATUS_SUCCESS while leaving the bytes on disk silently
+            // corrupts data: Windows truncates via 0x13 (what .NET
+            // `FileStream.SetLength(0)` and PowerShell `Set-Content` emit),
+            // never follows up with 0x14, and then reopens with
+            // FILE_APPEND_DATA — so the "new" content lands after the stale
+            // bytes instead of replacing them. macOS smbfs sends 0x14
+            // directly and is unaffected either way.
+            if buffer.len() < 8 {
+                return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
+            }
+            let allocation = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
+            let open = open_arc.read().await;
+            let handle = match open.handle.as_ref() {
+                Some(h) => h,
+                None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
+            };
+            match handle.stat().await {
+                // Shrink: reuse the exact backend set-length path 0x14 takes.
+                Ok(info) if allocation < info.end_of_file => handle.truncate(allocation).await,
+                // At or above EndOfFile: nothing to do, we never preallocate.
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            }
         }
         _ => return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED),
     };
