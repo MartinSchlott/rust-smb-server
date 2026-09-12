@@ -1,6 +1,6 @@
 [package]
 name = "smb-server"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -15,14 +15,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/MartinSchlott/rust-smb-server"
 
 [workspace.dependencies]
-smb-server = { path = ".", version = "0.4.2" }
+smb-server = { path = ".", version = "0.5.0" }
 
 tokio = { version = "1.40", features = ["full"] }
 # Floor is 0.15.2, not 0.15: 0.15.1 privately re-exports `extern crate binrw`, which
