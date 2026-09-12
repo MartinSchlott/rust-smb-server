@@ -6,7 +6,7 @@ use crate::proto::auth::ntlm::Identity;
 use crate::proto::crypto::{PreauthIntegrity, sign};
 use crate::proto::header::{
     Command, HeaderTail, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_RELATED_OPERATIONS,
-    SMB2_FLAGS_SERVER_TO_REDIR, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN, Smb2Header,
+    SMB2_FLAGS_SERVER_TO_REDIR, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN, SMB2_MAGIC, Smb2Header,
 };
 use crate::proto::messages::ErrorResponse;
 use tracing::{Instrument, debug, debug_span, error, warn};
@@ -287,6 +287,71 @@ fn read_u64(buf: &[u8], offset: usize) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&buf[offset..offset + 8]);
     u64::from_le_bytes(bytes)
+}
+
+/// Frames that MUST NOT be dispatched concurrently with anything else on
+/// their connection (PLAN_PERF1 Step 6).
+///
+/// Returns `true` if **any** sub-command in the compound chain is
+/// `Negotiate`, `SessionSetup`, `Logoff`, `TreeConnect` or
+/// `TreeDisconnect` — NEGOTIATE and SESSION_SETUP mutate connection-wide
+/// negotiated state and multi-leg auth state (`pending_auths`,
+/// `session_preauth`, the `preauth` hash); LOGOFF and TREE_DISCONNECT tear
+/// down state an in-flight data operation may hold.
+///
+/// Walks the **entire** `NextCommand` chain, not just the first header.
+/// MS-SMB2 permits compounding unrelated requests, and `dispatch_frame`
+/// dispatches every sub-header without filtering — so an `ECHO + LOGOFF`
+/// frame classified on its first header alone would be spawned and would
+/// tear a session down underneath outstanding READs.
+///
+/// Also returns `true` for a frame shorter than `SMB2_HEADER_LEN`, a frame
+/// not beginning with the SMB2 magic (the SMB1 multi-protocol bootstrap),
+/// and any sub-header that fails to parse or whose `NextCommand` does not
+/// point at a complete subsequent header — deliberately stricter than
+/// `dispatch_frame`'s own guard, which tolerates `NextCommand` landing
+/// exactly at frame end by terminating its loop there. A chain promising a
+/// header that cannot exist must not take the concurrent path.
+pub(crate) fn frame_must_be_serialized(frame: &[u8]) -> bool {
+    if frame.len() < SMB2_HEADER_LEN || frame[0..4] != SMB2_MAGIC {
+        return true;
+    }
+
+    let mut sub_offset = 0;
+    loop {
+        let available = &frame[sub_offset..];
+        if available.len() < SMB2_HEADER_LEN {
+            return true;
+        }
+        let (hdr, _) = match Smb2Header::parse(available) {
+            Ok(p) => p,
+            Err(_) => return true,
+        };
+
+        if matches!(
+            hdr.command,
+            Command::Negotiate
+                | Command::SessionSetup
+                | Command::Logoff
+                | Command::TreeConnect
+                | Command::TreeDisconnect
+        ) {
+            return true;
+        }
+
+        let next = hdr.next_command as usize;
+        // `NextCommand == 0` terminates the chain and is normal — it is how
+        // every ordinary single-command frame and every final compound
+        // element is encoded. It MUST NOT be treated as malformed.
+        if next == 0 {
+            return false;
+        }
+        if next < SMB2_HEADER_LEN || next > available.len() || available.len() - next < SMB2_HEADER_LEN
+        {
+            return true;
+        }
+        sub_offset += next;
+    }
 }
 
 async fn dispatch_one(
@@ -847,5 +912,130 @@ mod tests {
 
         assert_eq!(got.snapshot(), expected);
         assert!(!conn.session_preauth.read().await.contains_key(&7));
+    }
+
+    // ── PLAN_PERF1 Step 6/8.6 — `frame_must_be_serialized` table test ──────
+
+    /// One sub-frame: exactly `SMB2_HEADER_LEN` bytes, header only, no body
+    /// — the predicate never looks past the header, so a body adds nothing
+    /// but noise. `next_command` is the caller's to set, matching
+    /// `echo_subframe`'s convention above.
+    fn bare_header(command: Command, next_command: u32) -> Vec<u8> {
+        let hdr = Smb2Header {
+            credit_charge: 1,
+            channel_sequence_status: 0,
+            command,
+            credit_request_response: 1,
+            flags: 0,
+            next_command,
+            message_id: 1,
+            tail: HeaderTail::sync(0),
+            session_id: 0,
+            signature: [0u8; 16],
+        };
+        let mut buf = Vec::new();
+        hdr.write(&mut buf).expect("encode header");
+        assert_eq!(buf.len(), SMB2_HEADER_LEN);
+        buf
+    }
+
+    /// A compound chain of bare headers, each exactly `SMB2_HEADER_LEN`
+    /// bytes — so a non-final element's `NextCommand` is always
+    /// `SMB2_HEADER_LEN`, the offset to the very next header.
+    fn compound_of(commands: &[Command]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        for (i, cmd) in commands.iter().enumerate() {
+            let next = if i + 1 < commands.len() {
+                SMB2_HEADER_LEN as u32
+            } else {
+                0
+            };
+            frame.extend(bare_header(*cmd, next));
+        }
+        frame
+    }
+
+    #[test]
+    fn frame_must_be_serialized_classifies_every_rule() {
+        let cases: Vec<(&str, Vec<u8>, bool)> = vec![
+            (
+                "Negotiate alone",
+                compound_of(&[Command::Negotiate]),
+                true,
+            ),
+            (
+                "SessionSetup alone",
+                compound_of(&[Command::SessionSetup]),
+                true,
+            ),
+            ("Logoff alone", compound_of(&[Command::Logoff]), true),
+            (
+                "TreeConnect alone",
+                compound_of(&[Command::TreeConnect]),
+                true,
+            ),
+            (
+                "TreeDisconnect alone",
+                compound_of(&[Command::TreeDisconnect]),
+                true,
+            ),
+            (
+                "a data-path command alone (Echo)",
+                compound_of(&[Command::Echo]),
+                false,
+            ),
+            (
+                "NextCommand == 0 terminates normally and is data-path, not malformed",
+                bare_header(Command::Read, 0),
+                false,
+            ),
+            (
+                "a chain whose serialized command is not first (Echo + Logoff)",
+                compound_of(&[Command::Echo, Command::Logoff]),
+                true,
+            ),
+            (
+                "a data-path-only chain (Echo + Read)",
+                compound_of(&[Command::Echo, Command::Read]),
+                false,
+            ),
+            (
+                "a nonzero NextCommand below SMB2_HEADER_LEN",
+                bare_header(Command::Echo, 10),
+                true,
+            ),
+            (
+                "a nonzero NextCommand overshooting the frame",
+                bare_header(Command::Echo, 1000),
+                true,
+            ),
+            (
+                "a nonzero NextCommand landing exactly at frame end",
+                bare_header(Command::Echo, SMB2_HEADER_LEN as u32),
+                true,
+            ),
+            (
+                "a truncated frame",
+                vec![0xFEu8, b'S', b'M', b'B'],
+                true,
+            ),
+            (
+                "a non-SMB2 frame (SMB1 multi-protocol bootstrap magic)",
+                {
+                    let mut f = vec![0xFFu8, b'S', b'M', b'B'];
+                    f.resize(SMB2_HEADER_LEN, 0);
+                    f
+                },
+                true,
+            ),
+        ];
+
+        for (name, frame, expected) in cases {
+            assert_eq!(
+                frame_must_be_serialized(&frame),
+                expected,
+                "case failed: {name}"
+            );
+        }
     }
 }
