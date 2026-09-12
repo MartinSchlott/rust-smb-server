@@ -100,11 +100,23 @@ pub async fn reader_task(
 
         if crate::dispatch::frame_must_be_serialized(&frame) {
             // Barrier: wait for every spawned dispatch to finish, then run
-            // this one inline, exactly like v1's sequential dispatch.
-            let _permits = inflight
-                .acquire_many(MAX_INFLIGHT as u32)
-                .await
-                .expect("inflight semaphore is never closed");
+            // this one inline, exactly like v1's sequential dispatch. Races
+            // writer closure the same way the frame read and the permit wait
+            // do — a serialized frame is admitted only when `dispatch_frame`
+            // is entered (the admission-point rule), so closure arriving
+            // while parked here must stop admission before that happens,
+            // not after a TREE_DISCONNECT/LOGOFF has already torn down state
+            // nothing will ever hear the response to.
+            let _permits = tokio::select! {
+                biased;
+                _ = tx.closed() => {
+                    debug!("writer channel closed while waiting for the serialization barrier; reader stopping admission");
+                    break Ok(());
+                }
+                permits = inflight.acquire_many(MAX_INFLIGHT as u32) => {
+                    permits.expect("inflight semaphore is never closed")
+                }
+            };
             let response = crate::dispatch::dispatch_frame(&server, &conn, &frame).await;
             if let Some(bytes) = response
                 && tx.send(bytes).await.is_err()
@@ -789,5 +801,80 @@ mod tests {
             .expect("reader must return once the drain completes")
             .expect("join");
         assert!(result.is_ok());
+    }
+
+    /// Regression: a closed writer must stop admission at the serialization
+    /// barrier too, not just at the frame read and the data-path permit
+    /// wait. Before the fix, `acquire_many` for a barrier frame was awaited
+    /// unraced, so a closed-writer TREE_DISCONNECT parked behind an
+    /// in-flight READ would still run to completion — tearing the tree down
+    /// for a response nothing will ever receive — once the READ released.
+    #[tokio::test]
+    async fn closed_writer_stops_admission_at_the_serialization_barrier() {
+        let sink = Arc::new(RequestCmdSink {
+            commands: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut server = ServerState::new(
+            ServerConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                netbios_name: "TEST".to_owned(),
+                max_read_size: 1 << 20,
+                max_write_size: 1 << 20,
+                server_guid: Uuid::nil(),
+            },
+            ServerUsers {
+                table: RwLock::new(HashMap::new()),
+            },
+            vec![],
+        );
+        server.trace_sink = Some(sink.clone());
+        let server = Arc::new(server);
+
+        let release = Arc::new(Notify::new());
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let (conn, session_id, tree_id, file_ids) = seeded_connection(
+            &server,
+            vec![blocking_handle(release.clone(), entered_tx)],
+        )
+        .await;
+
+        let (mut client, read_half) = tcp_pair().await;
+        let (tx, rx) = mpsc::channel::<crate::conn::writer::FramePayload>(TEST_CHANNEL);
+        let reader = tokio::spawn(reader_task(read_half, server.clone(), conn.clone(), tx));
+
+        let read_hdr = header(Command::Read, 1, session_id, tree_id);
+        write_frame(&mut client, &read_request_payload(&read_hdr, file_ids[0])).await;
+        assert!(recv_within(&mut entered_rx, Duration::from_secs(5)).await);
+
+        let td_hdr = header(Command::TreeDisconnect, 2, session_id, tree_id);
+        write_frame(&mut client, &tree_disconnect_payload(&td_hdr)).await;
+        // Give the reader a chance to read TREE_DISCONNECT and park at the
+        // serialization-barrier wait, behind the still in-flight READ.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        drop(rx); // writer closes while the reader is parked at the barrier.
+        release.notify_waiters(); // now let the blocked READ finish.
+
+        let result = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("reader must return once the drain completes")
+            .expect("join");
+        assert!(result.is_ok());
+
+        assert!(
+            !sink.commands.lock().unwrap().contains(&"TreeDisconnect"),
+            "TREE_DISCONNECT must not enter dispatch once the writer has closed"
+        );
+        let sess_arc = conn
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("session must still exist");
+        assert!(
+            sess_arc.read().await.trees.read().await.contains_key(&tree_id),
+            "TREE_DISCONNECT must not have torn down the tree it never entered"
+        );
     }
 }
