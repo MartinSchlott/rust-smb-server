@@ -6,6 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# Override machine-specific local Cargo configuration on the CI runner.
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
 jobs:
   publish:
     runs-on: ubuntu-latest
