@@ -634,6 +634,8 @@ mod tests {
             directory: false,
             non_directory: false,
             delete_on_close: false,
+            read_data: true,
+            write_data: true,
         }
     }
 
@@ -645,6 +647,8 @@ mod tests {
             directory: false,
             non_directory: false,
             delete_on_close: false,
+            read_data: true,
+            write_data: true,
         }
     }
 

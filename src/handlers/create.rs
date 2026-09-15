@@ -33,6 +33,53 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 
+/// What a CREATE's `DesiredAccess` mask says, split into the two levels a
+/// backend actually needs.
+///
+/// `want_read`/`want_write` are the historical *hints*: they are deliberately
+/// wide, because they gate tree-level write rejection and the "neither read
+/// nor write" fallback. `want_read` is set by a metadata-only open
+/// (`FILE_READ_ATTRIBUTES`), and `want_write` by `FILE_WRITE_ATTRIBUTES` or
+/// `DELETE` — none of which grant any right to the file's *contents*.
+///
+/// `read_data`/`write_data` are the narrow facts. A backend that opens a real
+/// descriptor must derive it from these: opening a file the caller only
+/// wanted to `stat` can fail on permissions, and renaming or retiming a
+/// read-only file is legitimate while opening it for writing is not.
+///
+/// `GENERIC_ALL` and `MAX_ALLOWED` are catch-alls and therefore appear on
+/// BOTH data sides — omitting either one would hand a read-only descriptor to
+/// a caller entitled to write.
+struct AccessFacts {
+    want_read: bool,
+    want_write: bool,
+    read_data: bool,
+    write_data: bool,
+}
+
+fn access_facts(desired_access: u32) -> AccessFacts {
+    AccessFacts {
+        want_read: desired_access
+            & (FILE_READ_DATA | FILE_READ_ATTRIBUTES | GENERIC_READ | GENERIC_ALL | MAX_ALLOWED)
+            != 0,
+        want_write: desired_access
+            & (FILE_WRITE_DATA
+                | FILE_APPEND_DATA
+                | FILE_WRITE_ATTRIBUTES
+                | DELETE
+                | GENERIC_WRITE
+                | GENERIC_ALL
+                | MAX_ALLOWED)
+            != 0,
+        read_data: desired_access
+            & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL | MAX_ALLOWED)
+            != 0,
+        write_data: desired_access
+            & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL | MAX_ALLOWED)
+            != 0,
+    }
+}
+
 // CreateDisposition
 const FILE_SUPERSEDE: u32 = 0x0000_0000;
 const FILE_OPEN: u32 = 0x0000_0001;
@@ -85,19 +132,14 @@ pub async fn handle(
         _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
     };
 
-    // Translate desired access into read/write hints.
-    let want_read = req.desired_access
-        & (FILE_READ_DATA | FILE_READ_ATTRIBUTES | GENERIC_READ | GENERIC_ALL | MAX_ALLOWED)
-        != 0;
-    let want_write = req.desired_access
-        & (FILE_WRITE_DATA
-            | FILE_APPEND_DATA
-            | FILE_WRITE_ATTRIBUTES
-            | DELETE
-            | GENERIC_WRITE
-            | GENERIC_ALL
-            | MAX_ALLOWED)
-        != 0;
+    // Translate desired access into read/write hints and the narrower
+    // data-access facts (see `access_facts`).
+    let AccessFacts {
+        want_read,
+        want_write,
+        read_data,
+        write_data,
+    } = access_facts(req.desired_access);
 
     // Reject writes on a read-only tree.
     if want_write && !granted.allows_write() {
@@ -141,6 +183,8 @@ pub async fn handle(
     let opts = OpenOptions {
         read: want_read || !want_write,
         write: want_write,
+        read_data,
+        write_data,
         intent,
         directory,
         non_directory,
@@ -333,6 +377,77 @@ fn build_aapl_response_context(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    // The data/hint split (`access_facts`). These four combinations are the
+    // ones that bite: each has a hint set where the corresponding data fact
+    // must not be, or a catch-all that must reach both sides.
+
+    #[test]
+    fn metadata_only_open_is_a_read_hint_but_not_a_data_read() {
+        let f = access_facts(FILE_READ_ATTRIBUTES);
+        assert!(f.want_read, "the hint stays wide");
+        assert!(
+            !f.read_data,
+            "a stat-only open must not make a backend open the file for reading"
+        );
+        assert!(!f.write_data);
+    }
+
+    #[test]
+    fn delete_open_is_a_write_hint_but_not_a_data_write() {
+        let f = access_facts(DELETE);
+        assert!(f.want_write, "the hint stays wide");
+        assert!(
+            !f.write_data,
+            "renaming or deleting is governed by the parent directory, not by write access to the content"
+        );
+        assert!(!f.read_data);
+    }
+
+    #[test]
+    fn attribute_write_is_a_write_hint_but_not_a_data_write() {
+        let f = access_facts(FILE_WRITE_ATTRIBUTES);
+        assert!(f.want_write);
+        assert!(!f.write_data, "retiming a read-only file is legitimate");
+    }
+
+    #[test]
+    fn max_allowed_grants_both_data_sides() {
+        let f = access_facts(MAX_ALLOWED);
+        assert!(
+            f.read_data && f.write_data,
+            "a catch-all must reach both sides, or a writable file gets a read-only descriptor"
+        );
+    }
+
+    #[test]
+    fn generic_all_grants_both_data_sides() {
+        let f = access_facts(GENERIC_ALL);
+        assert!(f.read_data && f.write_data);
+    }
+
+    #[test]
+    fn data_read_plus_attribute_write_reads_data_but_does_not_write_it() {
+        let f = access_facts(FILE_READ_DATA | FILE_WRITE_ATTRIBUTES);
+        assert!(f.read_data);
+        assert!(!f.write_data);
+        assert!(
+            f.want_write,
+            "the handle may still be asked to set timestamps, which the opener must allow for"
+        );
+    }
+
+    #[test]
+    fn plain_data_access_sets_both_levels() {
+        let r = access_facts(FILE_READ_DATA);
+        assert!(r.want_read && r.read_data && !r.write_data);
+        let w = access_facts(FILE_WRITE_DATA);
+        assert!(w.want_write && w.write_data && !w.read_data);
+        let a = access_facts(FILE_APPEND_DATA);
+        assert!(a.write_data);
+    }
+
     use super::*;
     use crate::conn::state::{Session, TreeConnect};
     use crate::proto::auth::ntlm::Identity;

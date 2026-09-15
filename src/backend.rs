@@ -45,6 +45,16 @@ pub struct OpenOptions {
     pub non_directory: bool,
     /// `FILE_DELETE_ON_CLOSE` was set on CREATE.
     pub delete_on_close: bool,
+    /// Data-read access was requested, as distinct from `read`, which is also
+    /// set by a metadata-only open (`FILE_READ_ATTRIBUTES`) and by the
+    /// "neither read nor write" fallback. A backend that opens a real
+    /// descriptor must derive it from this, not from `read`: opening a file
+    /// the caller only wanted to `stat` can fail on permissions, or block.
+    pub read_data: bool,
+    /// Data-write access was requested, as distinct from `write`, which is
+    /// also set by `FILE_WRITE_ATTRIBUTES` and by `DELETE` — neither of which
+    /// implies any right to the file's contents.
+    pub write_data: bool,
 }
 
 impl Default for OpenOptions {
@@ -56,6 +66,8 @@ impl Default for OpenOptions {
             directory: false,
             non_directory: false,
             delete_on_close: false,
+            read_data: true,
+            write_data: false,
         }
     }
 }
