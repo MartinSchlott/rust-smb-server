@@ -998,8 +998,8 @@ mod tests {
             },
         ];
         let full = crate::info_class::encode_file_stream_information(&info, Some(&streams));
-        // Primary (38 bytes, padded to 40) then `:a:$DATA` (38 bytes, padded to
-        // 40) fit in 80; `:b:$DATA` does not.
+        // Primary (38 bytes, padded to 40) then `:a:$DATA` (40 bytes, no
+        // padding) fit in 80; `:b:$DATA` does not.
         let partial =
             crate::info_class::truncate_file_stream_information(&full, 80).expect("two fit");
         assert!(partial.len() <= 80);

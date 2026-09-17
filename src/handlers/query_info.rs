@@ -581,8 +581,9 @@ mod tests {
             crate::proto::header::Command::QueryInfo,
         );
 
-        // The primary entry is 38 bytes; each `:xxx:$DATA` entry is 42 bytes
-        // padded to 48. A 96-byte buffer fits the primary and one stream.
+        // The primary entry is 38 bytes; each `:xxx:$DATA` entry is 44 bytes
+        // (10 UTF-16 chars) padded to 48. A 96-byte buffer fits the primary
+        // and one stream.
         let resp = handle(
             &server,
             &conn,
