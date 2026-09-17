@@ -92,6 +92,10 @@ pub enum TraceEvent {
     },
     /// `set_info.rs`, any other information class.
     SetInfoOther { info_class: u8 },
+    /// `query_info.rs`: the queried information type and class. Without it a
+    /// QUERY_INFO appears as a bare command in the wire log, so a
+    /// `FILE_STREAM_INFORMATION` query is indistinguishable from any other.
+    QueryInfo { info_type: u8, info_class: u8 },
     /// `write.rs`.
     Write {
         file_id: [u8; 16],

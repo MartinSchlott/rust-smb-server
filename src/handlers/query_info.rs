@@ -26,7 +26,7 @@ const FILE_SUPPORTS_EXTENDED_ATTRIBUTES: u32 = 0x0080_0000;
 const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
 
 pub async fn handle(
-    _server: &Arc<ServerState>,
+    server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
@@ -39,6 +39,19 @@ pub async fn handle(
         Some(t) => t,
         None => return HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS),
     };
+
+    // Record the queried type/class so a `FILE_STREAM_INFORMATION` query is
+    // distinguishable in the wire log from any other QUERY_INFO (Step 1d).
+    if server.trace_sink.is_some() {
+        crate::trace::record(
+            &server.trace_sink,
+            crate::trace::current_trace_key(),
+            crate::trace::TraceEvent::QueryInfo {
+                info_type: req.info_type,
+                info_class: req.file_information_class,
+            },
+        );
+    }
 
     let tree_arc = match lookup_session_tree(conn, hdr).await {
         Ok(t) => t,
@@ -58,6 +71,11 @@ pub async fn handle(
             None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
         }
     };
+
+    // Set when `FILE_STREAM_INFORMATION` had to be truncated to fit the
+    // client's output buffer; answered with `STATUS_BUFFER_OVERFLOW` and the
+    // partial (whole-entry) chain, per MS-FSCC §2.4.43.
+    let mut buffer_overflow = false;
 
     let buf: Vec<u8> = match info_type {
         InfoType::File => {
@@ -84,7 +102,39 @@ pub async fn handle(
                 ic::FILE_NETWORK_OPEN_INFORMATION => {
                     ic::encode_file_network_open_information(&info)
                 }
-                ic::FILE_STREAM_INFORMATION => ic::encode_file_stream_information(&info),
+                ic::FILE_STREAM_INFORMATION => {
+                    let streams = {
+                        let open = open_arc.read().await;
+                        match open.handle.as_ref() {
+                            Some(h) => h.list_streams().await,
+                            None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
+                        }
+                    };
+                    let streams = match streams {
+                        Ok(s) => s,
+                        Err(e) => return HandlerResponse::err(e.to_nt_status()),
+                    };
+                    let full = ic::encode_file_stream_information(&info, streams.as_deref());
+                    if full.len() as u32 > req.output_buffer_length {
+                        // A file with many streams can exceed the client's
+                        // buffer where the pre-plan single hardcoded entry
+                        // never could. Emit as many whole entries as fit —
+                        // `::$DATA` first, so the client always learns the
+                        // file has a data stream — and terminate the chain.
+                        match ic::truncate_file_stream_information(&full, req.output_buffer_length)
+                        {
+                            Some(partial) => {
+                                buffer_overflow = true;
+                                partial
+                            }
+                            None => {
+                                return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
+                            }
+                        }
+                    } else {
+                        full
+                    }
+                }
                 _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS),
             }
         }
@@ -153,19 +203,26 @@ pub async fn handle(
     let mut out = Vec::new();
     resp.write_to(&mut out)
         .expect("QUERY_INFO response encodes");
-    HandlerResponse::ok(out)
+    let mut response = HandlerResponse::ok(out);
+    if buffer_overflow {
+        response.status = ntstatus::STATUS_BUFFER_OVERFLOW;
+    }
+    response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{OpenIntent, OpenOptions, ShareBackend as _};
     use crate::conn::state::{Connection, Session, TreeConnect};
+    use crate::path::SmbPath;
     use crate::proto::auth::ntlm::Identity;
     use crate::proto::header::{HeaderTail, Smb2Header};
     use crate::proto::messages::{CreateRequest, CreateResponse, FileId};
     use crate::server::{ServerConfig, ServerState, ServerUsers, ShareBindings, ShareMode};
     use crate::tests::memfs::MemFsBackend;
     use std::collections::HashMap;
+    use std::sync::Mutex;
     use uuid::Uuid;
 
     fn test_server() -> Arc<ServerState> {
@@ -311,5 +368,261 @@ mod tests {
             0,
             "MemFsBackend implements streams — FILE_NAMED_STREAMS must be advertised"
         );
+    }
+
+    // ── QUERY_INFO information type/class and stream enumeration (Step 1e) ──
+
+    struct RecordingSink {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl crate::trace::TraceSink for RecordingSink {
+        fn record(&self, _key: Option<crate::trace::TraceKey>, event: &crate::trace::TraceEvent) {
+            self.events.lock().unwrap().push(format!("{event:?}"));
+        }
+    }
+
+    fn test_server_with_sink(sink: Arc<dyn crate::trace::TraceSink>) -> Arc<ServerState> {
+        let mut server = test_server();
+        Arc::get_mut(&mut server)
+            .expect("test_server hands back a uniquely owned Arc")
+            .trace_sink = Some(sink);
+        server
+    }
+
+    fn open_opts() -> OpenOptions {
+        OpenOptions {
+            read: true,
+            write: true,
+            intent: OpenIntent::OpenOrCreate,
+            directory: false,
+            non_directory: false,
+            delete_on_close: false,
+            read_data: true,
+            write_data: true,
+        }
+    }
+
+    /// Opens a named file through a real CREATE and returns its `FileId`.
+    async fn open_named(
+        server: &Arc<ServerState>,
+        conn: &Arc<Connection>,
+        session_id: u64,
+        tree_id: u32,
+        name: &str,
+    ) -> FileId {
+        let name_u16: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let req = CreateRequest {
+            structure_size: 57,
+            security_flags: 0,
+            requested_oplock_level: 0,
+            impersonation_level: 2,
+            smb_create_flags: 0,
+            reserved: 0,
+            desired_access: 0x0012_0089,
+            file_attributes: 0,
+            share_access: 0x0000_0007,
+            create_disposition: 1, // FILE_OPEN
+            create_options: 0,
+            name_offset: 0x78,
+            name_length: name_u16.len() as u16,
+            create_contexts_offset: 0,
+            create_contexts_length: 0,
+            name: name_u16,
+            create_contexts: vec![],
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).unwrap();
+        let hdr = header(
+            session_id,
+            tree_id,
+            1,
+            crate::proto::header::Command::Create,
+        );
+        let resp = crate::handlers::create::handle(server, conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS, "setup: open {name}");
+        CreateResponse::parse(&resp.body).unwrap().file_id
+    }
+
+    fn file_query(file_id: FileId, class: u8, output_buffer_length: u32) -> Vec<u8> {
+        let req = QueryInfoRequest {
+            structure_size: 41,
+            info_type: InfoType::File as u8,
+            file_information_class: class,
+            output_buffer_length,
+            input_buffer_offset: 0,
+            reserved: 0,
+            input_buffer_length: 0,
+            additional_information: 0,
+            flags: 0,
+            file_id,
+            input_buffer: vec![],
+        };
+        let mut body = Vec::new();
+        req.write_to(&mut body).unwrap();
+        body
+    }
+
+    /// Decodes the names of an encoded `FILE_STREAM_INFORMATION` chain.
+    fn stream_names(buf: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut offset = 0usize;
+        while offset + 24 <= buf.len() {
+            let next = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
+            let name_len =
+                u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let units: Vec<u16> = buf[offset + 24..offset + 24 + name_len]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            names.push(String::from_utf16(&units).unwrap());
+            if next == 0 {
+                break;
+            }
+            offset += next as usize;
+        }
+        names
+    }
+
+    #[tokio::test]
+    async fn query_info_records_its_information_type_and_class() {
+        let recorder = Arc::new(RecordingSink {
+            events: Mutex::new(Vec::new()),
+        });
+        let server = test_server_with_sink(recorder.clone());
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let file_id = open_root(&server, &conn, session_id, tree_id).await;
+        let hdr = header(
+            session_id,
+            tree_id,
+            2,
+            crate::proto::header::Command::QueryInfo,
+        );
+
+        let resp = handle(&server, &conn, &hdr, &fs_attribute_query(file_id)).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
+
+        let events = recorder.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| e.contains("QueryInfo")
+                && e.contains("info_type: 2")
+                && e.contains("info_class: 5")),
+            "the QUERY_INFO type and class must be recorded: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_information_lists_named_streams_through_the_handler() {
+        let server = test_server();
+        let backend = MemFsBackend::new().with_file("f.txt", b"primary");
+        {
+            let h = backend
+                .open(
+                    &"f.txt:AFP_AfpInfo".parse::<SmbPath>().unwrap(),
+                    open_opts(),
+                )
+                .await
+                .unwrap();
+            h.write(0, b"finder info blob").await.unwrap();
+            h.close().await.unwrap();
+        }
+        let (conn, session_id, tree_id) = test_conn_with_tree(backend).await;
+        let file_id = open_named(&server, &conn, session_id, tree_id, "f.txt").await;
+        let hdr = header(
+            session_id,
+            tree_id,
+            3,
+            crate::proto::header::Command::QueryInfo,
+        );
+
+        let resp = handle(
+            &server,
+            &conn,
+            &hdr,
+            &file_query(file_id, ic::FILE_STREAM_INFORMATION, 4096),
+        )
+        .await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
+
+        let qresp = QueryInfoResponse::parse(&resp.body).unwrap();
+        assert_eq!(
+            stream_names(&qresp.buffer),
+            vec!["::$DATA", ":AFP_AfpInfo:$DATA"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_information_overflow_returns_a_terminated_partial_chain() {
+        let server = test_server();
+        let backend = MemFsBackend::new().with_file("f.txt", b"primary");
+        {
+            for (name, data) in [
+                ("aaa", b"A".as_slice()),
+                ("bbb", b"BB".as_slice()),
+                ("ccc", b"CCC".as_slice()),
+            ] {
+                let h = backend
+                    .open(
+                        &format!("f.txt:{name}").parse::<SmbPath>().unwrap(),
+                        open_opts(),
+                    )
+                    .await
+                    .unwrap();
+                h.write(0, data).await.unwrap();
+                h.close().await.unwrap();
+            }
+        }
+        let (conn, session_id, tree_id) = test_conn_with_tree(backend).await;
+        let file_id = open_named(&server, &conn, session_id, tree_id, "f.txt").await;
+        let hdr = header(
+            session_id,
+            tree_id,
+            4,
+            crate::proto::header::Command::QueryInfo,
+        );
+
+        // The primary entry is 38 bytes; each `:xxx:$DATA` entry is 42 bytes
+        // padded to 48. A 96-byte buffer fits the primary and one stream.
+        let resp = handle(
+            &server,
+            &conn,
+            &hdr,
+            &file_query(file_id, ic::FILE_STREAM_INFORMATION, 96),
+        )
+        .await;
+        assert_eq!(
+            resp.status,
+            ntstatus::STATUS_BUFFER_OVERFLOW,
+            "a truncated stream chain must be reported as BUFFER_OVERFLOW, not rejected"
+        );
+
+        let qresp = QueryInfoResponse::parse(&resp.body).unwrap();
+        assert!(qresp.output_buffer_length <= 96);
+        let names = stream_names(&qresp.buffer);
+        assert_eq!(names[0], "::$DATA", "the primary entry must come first");
+        assert_eq!(names.len(), 2, "primary plus one whole named entry");
+    }
+
+    #[tokio::test]
+    async fn stream_information_too_small_for_the_primary_is_length_mismatch() {
+        let server = test_server();
+        let backend = MemFsBackend::new().with_file("f.txt", b"primary");
+        let (conn, session_id, tree_id) = test_conn_with_tree(backend).await;
+        let file_id = open_named(&server, &conn, session_id, tree_id, "f.txt").await;
+        let hdr = header(
+            session_id,
+            tree_id,
+            5,
+            crate::proto::header::Command::QueryInfo,
+        );
+
+        let resp = handle(
+            &server,
+            &conn,
+            &hdr,
+            &file_query(file_id, ic::FILE_STREAM_INFORMATION, 10),
+        )
+        .await;
+        assert_eq!(resp.status, ntstatus::STATUS_INFO_LENGTH_MISMATCH);
     }
 }

@@ -34,7 +34,7 @@ mod utils;
 
 pub use backend::{
     BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenIntent, OpenOptions,
-    ShareBackend,
+    ShareBackend, StreamEntry,
 };
 pub use builder::{Access, Share};
 pub use error::{SmbError, SmbResult};

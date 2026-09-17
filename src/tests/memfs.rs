@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use crate::backend::{
     BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenIntent, OpenOptions,
-    ShareBackend,
+    ShareBackend, StreamEntry,
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
@@ -447,6 +447,35 @@ impl Handle for MemHandle {
     async fn close(self: Box<Self>) -> SmbResult<()> {
         Ok(())
     }
+
+    async fn list_streams(&self) -> SmbResult<Option<Vec<StreamEntry>>> {
+        // A directory and a stream handle have no streams of their own; the
+        // protocol layer then reports the primary `::$DATA` entry alone.
+        if self.is_dir || self.stream.is_some() {
+            return Ok(None);
+        }
+        let g = self.inner.lock().unwrap();
+        let mut streams: Vec<StreamEntry> = g
+            .streams
+            .iter()
+            .filter(|((host, _), _)| host == &self.key)
+            .map(|((_, name), data)| StreamEntry {
+                name: name.clone(),
+                size: data.len() as u64,
+                allocation_size: stream_allocation_size(data.len() as u64),
+            })
+            .collect();
+        // readdir order is not stable; sort for a deterministic enumeration.
+        streams.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Some(streams))
+    }
+}
+
+/// `size` rounded up to the 4096-byte cluster this fork advertises
+/// (`encode_fs_size_information`: one 4096-byte sector per cluster); `0` for
+/// an empty stream.
+fn stream_allocation_size(size: u64) -> u64 {
+    size.div_ceil(4096) * 4096
 }
 
 #[cfg(test)]
@@ -781,5 +810,285 @@ mod tests {
                 .get(&("new.txt".to_string(), "AFP_AfpInfo".to_string())),
             Some(&b"meta".to_vec())
         );
+    }
+
+    // ── Named-stream enumeration (Step 1e) ──────────────────────────────
+
+    fn stream_info() -> FileInfo {
+        FileInfo {
+            name: "file.txt".to_string(),
+            end_of_file: 100,
+            allocation_size: 4096,
+            creation_time: 0x01D9_0000_0000_0000,
+            last_access_time: 0x01D9_0000_0000_0000,
+            last_write_time: 0x01D9_0000_0000_0000,
+            change_time: 0x01D9_0000_0000_0000,
+            is_directory: false,
+            file_index: 1,
+        }
+    }
+
+    /// Decodes an encoded `FILE_STREAM_INFORMATION` chain into
+    /// `(name, size, allocation_size, next_entry_offset)` tuples.
+    fn decode_stream_chain(buf: &[u8]) -> Vec<(String, u64, u64, u32)> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        while offset + 24 <= buf.len() {
+            let next = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
+            let name_len =
+                u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let size = u64::from_le_bytes(buf[offset + 8..offset + 16].try_into().unwrap());
+            let alloc = u64::from_le_bytes(buf[offset + 16..offset + 24].try_into().unwrap());
+            let units: Vec<u16> = buf[offset + 24..offset + 24 + name_len]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            out.push((String::from_utf16(&units).unwrap(), size, alloc, next));
+            if next == 0 {
+                break;
+            }
+            offset += next as usize;
+        }
+        out
+    }
+
+    #[test]
+    fn no_named_streams_encodes_the_pre_change_primary_entry_byte_for_byte() {
+        let info = stream_info();
+        let got = crate::info_class::encode_file_stream_information(&info, None);
+
+        // The exact bytes the single-entry encoder produced before this
+        // change: one `::$DATA` entry, size and allocation from `info`.
+        let name: Vec<u8> = "::$DATA"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut want = Vec::new();
+        want.extend_from_slice(&0u32.to_le_bytes());
+        want.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        want.extend_from_slice(&info.end_of_file.to_le_bytes());
+        want.extend_from_slice(&info.allocation_size.to_le_bytes());
+        want.extend_from_slice(&name);
+
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn named_streams_follow_the_primary_entry_with_their_own_sizes() {
+        let info = stream_info();
+        let streams = vec![
+            StreamEntry {
+                name: "a".to_string(),
+                size: 10,
+                allocation_size: 4096,
+            },
+            StreamEntry {
+                name: "bb".to_string(),
+                size: 0,
+                allocation_size: 0,
+            },
+        ];
+        let entries = decode_stream_chain(&crate::info_class::encode_file_stream_information(
+            &info,
+            Some(&streams),
+        ));
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, "::$DATA");
+        assert_eq!(entries[0].1, info.end_of_file);
+        assert_eq!(entries[0].2, info.allocation_size);
+        assert_eq!(entries[1].0, ":a:$DATA");
+        assert_eq!(entries[1].1, 10);
+        assert_eq!(entries[1].2, 4096);
+        assert_eq!(entries[2].0, ":bb:$DATA");
+        assert_eq!(entries[2].1, 0);
+        assert_eq!(entries[2].2, 0);
+    }
+
+    #[test]
+    fn every_emitted_name_parses_back_through_smbpath() {
+        let info = stream_info();
+        let streams = vec![
+            StreamEntry {
+                name: "AFP_AfpInfo".to_string(),
+                size: 4,
+                allocation_size: 4096,
+            },
+            StreamEntry {
+                name: "com.apple.ResourceFork".to_string(),
+                size: 4,
+                allocation_size: 4096,
+            },
+        ];
+        let entries = decode_stream_chain(&crate::info_class::encode_file_stream_information(
+            &info,
+            Some(&streams),
+        ));
+
+        let primary: SmbPath = format!("file.txt{}", entries[0].0).parse().unwrap();
+        assert_eq!(primary.stream_name(), None, "::$DATA is not a named stream");
+        for (emitted, ..) in &entries[1..] {
+            let stored = emitted
+                .strip_prefix(':')
+                .and_then(|s| s.strip_suffix(":$DATA"))
+                .expect("emitted name is :<name>:$DATA");
+            let parsed: SmbPath = format!("file.txt{emitted}").parse().unwrap();
+            assert_eq!(parsed.stream_name(), Some(stored));
+        }
+    }
+
+    #[test]
+    fn stream_chain_offsets_are_eight_byte_aligned_and_terminated() {
+        let info = stream_info();
+        let streams = vec![
+            StreamEntry {
+                name: "a".to_string(),
+                size: 1,
+                allocation_size: 4096,
+            },
+            StreamEntry {
+                name: "longer-name".to_string(),
+                size: 2,
+                allocation_size: 4096,
+            },
+            StreamEntry {
+                name: "z".to_string(),
+                size: 3,
+                allocation_size: 4096,
+            },
+        ];
+        let buf = crate::info_class::encode_file_stream_information(&info, Some(&streams));
+
+        let mut offset = 0usize;
+        let mut seen = 0usize;
+        loop {
+            assert_eq!(offset % 8, 0, "entry at offset {offset} is not aligned");
+            let next = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap());
+            let name_len =
+                u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            seen += 1;
+            if next == 0 {
+                assert_eq!(
+                    offset + 24 + name_len,
+                    buf.len(),
+                    "the final entry must end the buffer"
+                );
+                break;
+            }
+            assert_eq!(next % 8, 0, "NextEntryOffset must be 8-byte aligned");
+            offset += next as usize;
+            assert!(offset < buf.len(), "NextEntryOffset must land on an entry");
+        }
+        assert_eq!(seen, streams.len() + 1, "primary plus every named stream");
+    }
+
+    #[test]
+    fn truncation_keeps_whole_entries_and_terminates_the_chain() {
+        let info = stream_info();
+        let streams = vec![
+            StreamEntry {
+                name: "a".to_string(),
+                size: 10,
+                allocation_size: 4096,
+            },
+            StreamEntry {
+                name: "b".to_string(),
+                size: 20,
+                allocation_size: 4096,
+            },
+        ];
+        let full = crate::info_class::encode_file_stream_information(&info, Some(&streams));
+        // Primary (38 bytes, padded to 40) then `:a:$DATA` (38 bytes, padded to
+        // 40) fit in 80; `:b:$DATA` does not.
+        let partial =
+            crate::info_class::truncate_file_stream_information(&full, 80).expect("two fit");
+        assert!(partial.len() <= 80);
+
+        let entries = decode_stream_chain(&partial);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "::$DATA");
+        assert_eq!(entries[1].0, ":a:$DATA");
+        assert_eq!(
+            entries.last().unwrap().3,
+            0,
+            "the truncated chain must be terminated"
+        );
+    }
+
+    #[test]
+    fn truncation_below_the_primary_entry_is_none() {
+        let full = crate::info_class::encode_file_stream_information(&stream_info(), None);
+        assert!(crate::info_class::truncate_file_stream_information(&full, 10).is_none());
+        assert!(crate::info_class::truncate_file_stream_information(&full, 37).is_none());
+        assert!(crate::info_class::truncate_file_stream_information(&full, 38).is_some());
+    }
+
+    #[test]
+    fn a_directory_encodes_an_empty_stream_buffer() {
+        let mut info = stream_info();
+        info.is_directory = true;
+        let streams = vec![StreamEntry {
+            name: "a".to_string(),
+            size: 1,
+            allocation_size: 4096,
+        }];
+        assert!(
+            crate::info_class::encode_file_stream_information(&info, Some(&streams)).is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_streams_returns_tracked_streams_sorted_with_cluster_sizes() {
+        let fs = MemFsBackend::new().with_file("new.txt", b"fresh");
+        for (name, data) in [("zeta", b"z".as_slice()), ("alpha", b"abcdef".as_slice())] {
+            let h = fs
+                .open(&p(&format!("new.txt:{name}")), opts_create())
+                .await
+                .unwrap();
+            h.write(0, data).await.unwrap();
+            h.close().await.unwrap();
+        }
+
+        let h = fs.open(&p("new.txt"), opts_open_or_create()).await.unwrap();
+        let streams = h
+            .list_streams()
+            .await
+            .unwrap()
+            .expect("MemFsBackend tracks named streams");
+        let names: Vec<&str> = streams.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+        assert_eq!(streams[0].size, 6);
+        assert_eq!(streams[0].allocation_size, 4096);
+        assert_eq!(streams[1].size, 1);
+        assert!(
+            streams.iter().all(|s| s.allocation_size >= s.size),
+            "every stream's allocation size must cover its size"
+        );
+        h.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_streams_is_none_on_a_stream_handle_and_on_a_directory() {
+        let fs = MemFsBackend::new().with_file("new.txt", b"fresh");
+        let sh = fs
+            .open(&p("new.txt:AFP_AfpInfo"), opts_create())
+            .await
+            .unwrap();
+        assert!(sh.list_streams().await.unwrap().is_none());
+        sh.close().await.unwrap();
+
+        let dh = fs
+            .open(
+                &p("adir"),
+                OpenOptions {
+                    directory: true,
+                    intent: OpenIntent::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(dh.list_streams().await.unwrap().is_none());
+        dh.close().await.unwrap();
     }
 }

@@ -4,7 +4,7 @@
 //! These are byte-for-byte wire encodings per MS-FSCC §2.4 (file info) /
 //! §2.5 (filesystem info) / MS-DTYP §2.4 (security descriptor).
 
-use crate::backend::{DirEntry, FileInfo};
+use crate::backend::{DirEntry, FileInfo, StreamEntry};
 use crate::utils::utf16le;
 
 // ---------------------------------------------------------------------------
@@ -169,23 +169,99 @@ pub fn encode_file_network_open_information(info: &FileInfo) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// FileStreamInformation (MS-FSCC §2.4.43) — for non-directories, one default
-// stream entry (`::$DATA`); for directories, empty buffer.
+// FileStreamInformation (MS-FSCC §2.4.43) — for non-directories, the primary
+// `::$DATA` entry followed by one entry per named stream; for directories, an
+// empty buffer.
 // ---------------------------------------------------------------------------
 
-pub fn encode_file_stream_information(info: &FileInfo) -> Vec<u8> {
+/// The entries a `FILE_STREAM_INFORMATION` response carries for `info`: always
+/// the primary `::$DATA` entry first (a file's own data stream is never in the
+/// backend's `list_streams`), then each named stream as `:<name>:$DATA`.
+/// `None` streams means the backend does not track named streams for this
+/// object, which yields exactly the single primary entry the encoder produced
+/// before named-stream enumeration existed.
+fn stream_information_entries(
+    info: &FileInfo,
+    streams: Option<&[StreamEntry]>,
+) -> Vec<(String, u64, u64)> {
+    let mut entries = vec![(
+        "::$DATA".to_string(),
+        info.end_of_file,
+        info.allocation_size,
+    )];
+    if let Some(streams) = streams {
+        for s in streams {
+            entries.push((format!(":{}:$DATA", s.name), s.size, s.allocation_size));
+        }
+    }
+    entries
+}
+
+/// Encode one `FILE_STREAM_INFORMATION` entry with the given
+/// `NextEntryOffset`. The name is UTF-16LE and `StreamNameLength` counts its
+/// bytes.
+fn encode_stream_entry(name: &str, size: u64, allocation_size: u64, next_offset: u32) -> Vec<u8> {
+    let name_u16 = utf16le(name);
+    let mut out = Vec::with_capacity(24 + name_u16.len());
+    out.extend_from_slice(&next_offset.to_le_bytes());
+    out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&allocation_size.to_le_bytes());
+    out.extend_from_slice(&name_u16);
+    out
+}
+
+pub fn encode_file_stream_information(info: &FileInfo, streams: Option<&[StreamEntry]>) -> Vec<u8> {
     if info.is_directory {
         return Vec::new();
     }
-    let stream_name = utf16le("::$DATA");
-    let stream_name_len = stream_name.len() as u32;
+    let entries = stream_information_entries(info, streams);
     let mut out = Vec::new();
-    out.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset = 0
-    out.extend_from_slice(&stream_name_len.to_le_bytes()); // StreamNameLength
-    out.extend_from_slice(&info.end_of_file.to_le_bytes()); // StreamSize
-    out.extend_from_slice(&info.allocation_size.to_le_bytes()); // StreamAllocationSize
-    out.extend_from_slice(&stream_name);
+    for (i, (name, size, allocation_size)) in entries.iter().enumerate() {
+        // Every entry but the last is padded so the next begins 8-byte
+        // aligned, and its `NextEntryOffset` is the distance to that next
+        // entry. The last entry's offset is `0` and it carries no padding.
+        if i + 1 == entries.len() {
+            out.extend_from_slice(&encode_stream_entry(name, *size, *allocation_size, 0));
+        } else {
+            let entry = encode_stream_entry(name, *size, *allocation_size, 0);
+            let padded_len = align8(entry.len());
+            let mut padded = entry;
+            padded.resize(padded_len, 0);
+            padded[0..4].copy_from_slice(&(padded_len as u32).to_le_bytes());
+            out.extend_from_slice(&padded);
+        }
+    }
     out
+}
+
+/// Truncate an already-encoded `FILE_STREAM_INFORMATION` chain to the largest
+/// prefix of whole entries that fits in `max` bytes, zeroing the final emitted
+/// entry's `NextEntryOffset` so the chain is terminated. Returns `None` when
+/// not even the first entry fits, which the caller answers with
+/// `STATUS_INFO_LENGTH_MISMATCH`.
+pub fn truncate_file_stream_information(buf: &[u8], max: u32) -> Option<Vec<u8>> {
+    let max = max as usize;
+    let mut offset = 0usize;
+    // (start of the entry, its end without inter-entry padding)
+    let mut last: Option<(usize, usize)> = None;
+    while offset + 24 <= buf.len() {
+        let next = u32::from_le_bytes(buf[offset..offset + 4].try_into().ok()?) as usize;
+        let name_len = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().ok()?) as usize;
+        let unpadded_end = offset + 24 + name_len;
+        if unpadded_end > buf.len() || unpadded_end > max {
+            break;
+        }
+        last = Some((offset, unpadded_end));
+        if next == 0 {
+            break;
+        }
+        offset += next;
+    }
+    let (start, end) = last?;
+    let mut out = buf[..end].to_vec();
+    out[start..start + 4].copy_from_slice(&0u32.to_le_bytes());
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------

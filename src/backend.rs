@@ -115,6 +115,16 @@ impl FileInfo {
     }
 }
 
+/// One named stream attached to an open object, excluding the primary data
+/// stream. `name` is the bare stream name as `SmbPath::stream_name()` yields
+/// it — no leading `:`, no `:$DATA` suffix.
+#[derive(Debug, Clone)]
+pub struct StreamEntry {
+    pub name: String,
+    pub size: u64,
+    pub allocation_size: u64,
+}
+
 /// One entry of a directory listing.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -231,6 +241,14 @@ pub trait Handle: Send + Sync {
     /// `pattern` if the backend doesn't implement matching — the dispatcher
     /// post-filters as needed for QUERY_DIRECTORY.
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>>;
+
+    /// The named streams attached to this handle's object. `None` means the
+    /// backend does not track named streams for this object; the protocol layer
+    /// then reports the default `::$DATA` entry alone, which is the behaviour
+    /// every backend had before this method existed.
+    async fn list_streams(&self) -> SmbResult<Option<Vec<StreamEntry>>> {
+        Ok(None)
+    }
 
     /// Close the handle. Boxed self lets implementors consume internal state.
     async fn close(self: Box<Self>) -> SmbResult<()>;
