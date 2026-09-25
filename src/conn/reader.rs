@@ -271,8 +271,7 @@ mod tests {
     async fn tcp_pair() -> (TcpStream, ReadHalf<TcpStream>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let (accepted, connected) =
-            tokio::join!(listener.accept(), TcpStream::connect(addr));
+        let (accepted, connected) = tokio::join!(listener.accept(), TcpStream::connect(addr));
         let server_side = accepted.expect("accept").0;
         let client_side = connected.expect("connect");
         let (read_half, _write_half) = tokio::io::split(server_side);
@@ -351,7 +350,14 @@ mod tests {
         let _ = server;
         let conn = Arc::new(Connection::new(1, Uuid::nil(), 1 << 20, 1 << 20));
         let session_id = conn.alloc_session_id();
-        let session = Session::new(session_id, Identity::Anonymous, [0; 16], [0; 16], false, None);
+        let session = Session::new(
+            session_id,
+            Identity::Anonymous,
+            [0; 16],
+            [0; 16],
+            false,
+            None,
+        );
         let tree_id = session.alloc_tree_id();
         let share = ShareBindings::new(
             "test".to_owned(),
@@ -390,7 +396,10 @@ mod tests {
         (conn, session_id, tree_id, file_ids)
     }
 
-    fn blocking_handle(release: Arc<Notify>, entered: mpsc::UnboundedSender<()>) -> Box<dyn Handle> {
+    fn blocking_handle(
+        release: Arc<Notify>,
+        entered: mpsc::UnboundedSender<()>,
+    ) -> Box<dyn Handle> {
         Box::new(BlockingHandle {
             entered,
             release,
@@ -552,11 +561,8 @@ mod tests {
         let server = test_server();
         let release = Arc::new(Notify::new());
         let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
-        let (conn, session_id, tree_id, file_ids) = seeded_connection(
-            &server,
-            vec![blocking_handle(release.clone(), entered_tx)],
-        )
-        .await;
+        let (conn, session_id, tree_id, file_ids) =
+            seeded_connection(&server, vec![blocking_handle(release.clone(), entered_tx)]).await;
         let file_id = file_ids[0];
 
         let (mut client, read_half) = tcp_pair().await;
@@ -614,11 +620,8 @@ mod tests {
         let server = test_server();
         let release = Arc::new(Notify::new());
         let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
-        let (conn, session_id, tree_id, file_ids) = seeded_connection(
-            &server,
-            vec![blocking_handle(release.clone(), entered_tx)],
-        )
-        .await;
+        let (conn, session_id, tree_id, file_ids) =
+            seeded_connection(&server, vec![blocking_handle(release.clone(), entered_tx)]).await;
 
         let (mut client, read_half) = tcp_pair().await;
         let (tx, _rx) = mpsc::channel(TEST_CHANNEL);
@@ -649,11 +652,8 @@ mod tests {
         let server = test_server();
         let release = Arc::new(Notify::new());
         let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
-        let (conn, session_id, tree_id, file_ids) = seeded_connection(
-            &server,
-            vec![blocking_handle(release.clone(), entered_tx)],
-        )
-        .await;
+        let (conn, session_id, tree_id, file_ids) =
+            seeded_connection(&server, vec![blocking_handle(release.clone(), entered_tx)]).await;
 
         let (mut client, read_half) = tcp_pair().await;
         let (tx, _rx) = mpsc::channel(TEST_CHANNEL);
@@ -669,7 +669,10 @@ mod tests {
         let mut malformed = Vec::new();
         encode_frame(&[0u8; 100], &mut malformed);
         malformed.truncate(4 + 10);
-        client.write_all(&malformed).await.expect("write partial frame");
+        client
+            .write_all(&malformed)
+            .await
+            .expect("write partial frame");
         client.shutdown().await.expect("client shutdown");
 
         assert_not_yet_returned!(
@@ -683,7 +686,10 @@ mod tests {
             .await
             .expect("reader must return once the in-flight dispatch finishes")
             .expect("join");
-        assert!(result.is_err(), "a mid-body EOF must surface as a read error");
+        assert!(
+            result.is_err(),
+            "a mid-body EOF must surface as a read error"
+        );
     }
 
     // ── Test 5 — closed writer stops admission (R4), in all three wait
@@ -756,11 +762,8 @@ mod tests {
         let server = test_server();
         let release = Arc::new(Notify::new());
         let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
-        let (conn, session_id, tree_id, file_ids) = seeded_connection(
-            &server,
-            vec![blocking_handle(release.clone(), entered_tx)],
-        )
-        .await;
+        let (conn, session_id, tree_id, file_ids) =
+            seeded_connection(&server, vec![blocking_handle(release.clone(), entered_tx)]).await;
         let file_id = file_ids[0];
 
         let (mut client, read_half) = tcp_pair().await;
@@ -832,11 +835,8 @@ mod tests {
 
         let release = Arc::new(Notify::new());
         let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
-        let (conn, session_id, tree_id, file_ids) = seeded_connection(
-            &server,
-            vec![blocking_handle(release.clone(), entered_tx)],
-        )
-        .await;
+        let (conn, session_id, tree_id, file_ids) =
+            seeded_connection(&server, vec![blocking_handle(release.clone(), entered_tx)]).await;
 
         let (mut client, read_half) = tcp_pair().await;
         let (tx, rx) = mpsc::channel::<crate::conn::writer::FramePayload>(TEST_CHANNEL);
@@ -873,7 +873,13 @@ mod tests {
             .cloned()
             .expect("session must still exist");
         assert!(
-            sess_arc.read().await.trees.read().await.contains_key(&tree_id),
+            sess_arc
+                .read()
+                .await
+                .trees
+                .read()
+                .await
+                .contains_key(&tree_id),
             "TREE_DISCONNECT must not have torn down the tree it never entered"
         );
     }

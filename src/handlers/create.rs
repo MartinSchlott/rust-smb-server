@@ -71,8 +71,7 @@ fn access_facts(desired_access: u32) -> AccessFacts {
                 | GENERIC_ALL
                 | MAX_ALLOWED)
             != 0,
-        read_data: desired_access
-            & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL | MAX_ALLOWED)
+        read_data: desired_access & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL | MAX_ALLOWED)
             != 0,
         write_data: desired_access
             & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL | MAX_ALLOWED)
@@ -448,7 +447,6 @@ mod tests {
         assert!(a.write_data);
     }
 
-    use super::*;
     use crate::conn::state::{Session, TreeConnect};
     use crate::proto::auth::ntlm::Identity;
     use crate::proto::header::HeaderTail;

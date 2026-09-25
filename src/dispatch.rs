@@ -346,7 +346,9 @@ pub(crate) fn frame_must_be_serialized(frame: &[u8]) -> bool {
         if next == 0 {
             return false;
         }
-        if next < SMB2_HEADER_LEN || next > available.len() || available.len() - next < SMB2_HEADER_LEN
+        if next < SMB2_HEADER_LEN
+            || next > available.len()
+            || available.len() - next < SMB2_HEADER_LEN
         {
             return true;
         }
@@ -958,11 +960,7 @@ mod tests {
     #[test]
     fn frame_must_be_serialized_classifies_every_rule() {
         let cases: Vec<(&str, Vec<u8>, bool)> = vec![
-            (
-                "Negotiate alone",
-                compound_of(&[Command::Negotiate]),
-                true,
-            ),
+            ("Negotiate alone", compound_of(&[Command::Negotiate]), true),
             (
                 "SessionSetup alone",
                 compound_of(&[Command::SessionSetup]),
@@ -1014,11 +1012,7 @@ mod tests {
                 bare_header(Command::Echo, SMB2_HEADER_LEN as u32),
                 true,
             ),
-            (
-                "a truncated frame",
-                vec![0xFEu8, b'S', b'M', b'B'],
-                true,
-            ),
+            ("a truncated frame", vec![0xFEu8, b'S', b'M', b'B'], true),
             (
                 "a non-SMB2 frame (SMB1 multi-protocol bootstrap magic)",
                 {
