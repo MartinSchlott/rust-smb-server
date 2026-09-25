@@ -198,7 +198,9 @@ impl std::fmt::Display for SmbPath {
 /// must be `$DATA` (case-insensitive) — v1 doesn't support other stream
 /// types (e.g. `$INDEX_ALLOCATION`). An empty stream name paired with an
 /// absent or `$DATA` type (`name::$DATA`, or a bare trailing `name:`) means
-/// "the primary data stream", i.e. no stream at all.
+/// "the primary data stream", i.e. no stream at all. A stream named `.` or
+/// `..` is rejected here: a backend that stores streams as files would
+/// otherwise see a relative component in the stream name.
 fn split_stream_selector(last: &str) -> SmbResult<(&str, Option<String>)> {
     let Some((name, rest)) = last.split_once(':') else {
         return Ok((last, None));
@@ -210,6 +212,9 @@ fn split_stream_selector(last: &str) -> SmbResult<(&str, Option<String>)> {
     if let Some(ty) = ty
         && !ty.eq_ignore_ascii_case("$DATA")
     {
+        return Err(SmbError::NameInvalid);
+    }
+    if stream == "." || stream == ".." {
         return Err(SmbError::NameInvalid);
     }
     if stream.is_empty() {
@@ -381,6 +386,29 @@ mod tests {
     #[test]
     fn rejects_stream_selector_on_a_non_final_component() {
         assert!("dir:stream\\file.txt".parse::<SmbPath>().is_err());
+    }
+
+    #[test]
+    fn rejects_dot_and_dot_dot_stream_names() {
+        for p in [
+            "file.txt:.",
+            "file.txt:..",
+            "file.txt:.:$DATA",
+            "dir\\file.txt:..:$DATA",
+        ] {
+            assert!(
+                matches!(p.parse::<SmbPath>(), Err(SmbError::NameInvalid)),
+                "{p}"
+            );
+        }
+        // A dot inside an ordinary stream name is not special.
+        assert_eq!(
+            "file.txt:com.apple.provenance"
+                .parse::<SmbPath>()
+                .unwrap()
+                .stream_name(),
+            Some("com.apple.provenance")
+        );
     }
 
     #[test]
