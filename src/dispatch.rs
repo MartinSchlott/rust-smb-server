@@ -92,6 +92,9 @@ pub async fn dispatch_frame(
     let mut prev_session_id = 0;
     let mut prev_tree_id = 0;
     let mut prev_create_file_id = None;
+    // Status of a failed CREATE earlier in the current related chain
+    // (MS-SMB2 §3.3.5.2.7.2); see `related_create_failure`.
+    let mut create_failure: Option<u32> = None;
     let mut compound_ordinal: u32 = 0;
 
     while sub_offset < frame.len() {
@@ -124,7 +127,14 @@ pub async fn dispatch_frame(
         };
 
         let mut sub_frame = available[..sub_len].to_vec();
-        if req_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0 {
+        let related = req_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0;
+        if !related {
+            // An unrelated operation opens a new chain; a CREATE failure in
+            // the previous one no longer applies.
+            create_failure = None;
+        }
+        let inherited_failure = related_create_failure(related, req_hdr.command, create_failure);
+        if related {
             inherit_related_context(
                 &mut sub_frame,
                 &mut req_hdr,
@@ -137,9 +147,19 @@ pub async fn dispatch_frame(
         prev_session_id = req_hdr.session_id;
         prev_tree_id = req_hdr.tree_id().unwrap_or(0);
 
-        if let Some(response) = dispatch_one(server, conn, &sub_frame, compound_ordinal).await {
+        if let Some(response) = dispatch_one(
+            server,
+            conn,
+            &sub_frame,
+            compound_ordinal,
+            inherited_failure,
+        )
+        .await
+        {
             if req_hdr.command == Command::Create {
                 prev_create_file_id = capture_create_file_id(&response);
+                let status = read_u32(&response, 0x08);
+                create_failure = is_error_status(status).then_some(status);
             }
             responses.push(response);
         }
@@ -193,6 +213,37 @@ fn inherit_related_context(
     {
         sub_frame[offset..offset + 16].copy_from_slice(&file_id);
     }
+}
+
+/// The status a related operation MUST fail with because an earlier CREATE
+/// in its chain failed, or `None` when it is dispatched normally.
+///
+/// MS-SMB2 §3.3.5.2.7.2: when the current operation requires a FileId and the
+/// operation that would have supplied it failed, the server SHOULD fail the
+/// current operation with that same status. Without this, the related FileId
+/// stays the `0xFFFF…` sentinel and every follow-up answers
+/// `STATUS_FILE_CLOSED`, burying the CREATE's real status.
+///
+/// Only a failed **CREATE** propagates (Samba's `compound_create_err`), not a
+/// failed follow-up: a CREATE that succeeded holds an open handle, and failing
+/// its related CLOSE because a QUERY_INFO in between failed would leak it.
+fn related_create_failure(
+    related: bool,
+    command: Command,
+    create_failure: Option<u32>,
+) -> Option<u32> {
+    if related && file_id_body_offset(command).is_some() {
+        create_failure
+    } else {
+        None
+    }
+}
+
+/// NTSTATUS severity `STATUS_SEVERITY_ERROR` (top two bits set). Warnings
+/// such as `STATUS_BUFFER_OVERFLOW` and `STATUS_NO_MORE_FILES` are not
+/// failures.
+const fn is_error_status(status: u32) -> bool {
+    status >> 30 == 0b11
 }
 
 fn file_id_body_offset(command: Command) -> Option<usize> {
@@ -361,6 +412,7 @@ async fn dispatch_one(
     conn: &Arc<Connection>,
     frame: &[u8],
     compound_ordinal: u32,
+    inherited_failure: Option<u32>,
 ) -> Option<Vec<u8>> {
     let (req_hdr, body_bytes) = match Smb2Header::parse(frame) {
         Ok(p) => p,
@@ -430,7 +482,10 @@ async fn dispatch_one(
             session_preauth = Some(p);
         }
 
-        let resp = handlers::dispatch_command(server, conn, &req_hdr, body_bytes).await;
+        let resp = match inherited_failure {
+            Some(status) => HandlerResponse::err(status),
+            None => handlers::dispatch_command(server, conn, &req_hdr, body_bytes).await,
+        };
 
         // If the handler asked for a preauth snapshot (3.1.1), take it now.
         if let Some(sid) = resp.take_preauth_snapshot_for_session {
@@ -801,6 +856,41 @@ mod tests {
             .filter(|(_, text)| text.starts_with("Request"))
             .map(|(key, _)| key.expect("a Request event must carry a key when a sink is armed"))
             .collect()
+    }
+
+    #[test]
+    fn a_failed_create_propagates_to_related_file_id_operations() {
+        let failed = Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+        for command in [
+            Command::QueryInfo,
+            Command::Read,
+            Command::Close,
+            Command::SetInfo,
+        ] {
+            assert_eq!(
+                related_create_failure(true, command, failed),
+                failed,
+                "{command:?} related to a failed CREATE must fail with its status"
+            );
+        }
+    }
+
+    #[test]
+    fn no_propagation_without_relation_file_id_or_failure() {
+        let failed = Some(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+        assert_eq!(related_create_failure(false, Command::Close, failed), None);
+        assert_eq!(related_create_failure(true, Command::Echo, failed), None);
+        assert_eq!(related_create_failure(true, Command::Create, failed), None);
+        assert_eq!(related_create_failure(true, Command::Close, None), None);
+    }
+
+    #[test]
+    fn only_error_severity_counts_as_failure() {
+        assert!(is_error_status(ntstatus::STATUS_OBJECT_NAME_NOT_FOUND));
+        assert!(is_error_status(ntstatus::STATUS_FILE_CLOSED));
+        assert!(!is_error_status(ntstatus::STATUS_SUCCESS));
+        assert!(!is_error_status(0x8000_0005)); // STATUS_BUFFER_OVERFLOW
+        assert!(!is_error_status(0x8000_0006)); // STATUS_NO_MORE_FILES
     }
 
     #[tokio::test]

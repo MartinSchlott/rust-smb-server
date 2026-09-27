@@ -375,6 +375,155 @@ fn decode_file_id_both_names(mut buf: &[u8]) -> Vec<String> {
     names
 }
 
+/// MS-SMB2 §3.3.5.2.7.2: a related operation whose FileId the failed CREATE
+/// would have supplied fails with the CREATE's status, not
+/// `STATUS_FILE_CLOSED`. A failed follow-up, by contrast, MUST NOT poison the
+/// related CLOSE of a CREATE that succeeded — that would leak the handle.
+#[tokio::test]
+async fn compound_follow_ups_carry_the_failed_create_status() {
+    let td = tempdir().expect("tempdir");
+    std::fs::write(td.path().join("hello.txt"), b"hi").expect("write hello.txt");
+
+    let backend = LocalFsBackend::new(td.path()).expect("open root");
+    let server = SmbServer::builder()
+        .listen("127.0.0.1:0".parse().unwrap())
+        .share(Share::new("share", backend).public())
+        .netbios_name("TESTSERVER")
+        .build()
+        .expect("build");
+    server.bind().await.expect("bind");
+    let addr = server.local_addr().await.expect("addr");
+    let handle = tokio::spawn(async move { server.serve().await });
+    tokio::task::yield_now().await;
+
+    let mut s = TcpStream::connect(addr).await.expect("connect");
+    let _ = negotiate(&mut s).await;
+    let session_id = anonymous_session_setup(&mut s).await;
+    let tree_id = tree_connect(&mut s, "\\\\127.0.0.1\\share", session_id, 3).await;
+
+    // 1. CREATE of a missing file, then related QUERY_INFO and CLOSE.
+    let statuses =
+        send_create_query_close(&mut s, session_id, tree_id, 4, "missing.txt", 0x12).await;
+    let create_status = statuses[0];
+    assert_ne!(
+        create_status, STATUS_SUCCESS,
+        "CREATE of a missing file must fail"
+    );
+    assert_ne!(create_status, STATUS_FILE_CLOSED);
+    assert_eq!(
+        statuses[1], create_status,
+        "related QUERY_INFO must carry the failed CREATE's status"
+    );
+    assert_eq!(
+        statuses[2], create_status,
+        "related CLOSE must carry the failed CREATE's status"
+    );
+
+    // 2. CREATE succeeds, the related QUERY_INFO fails on an invalid class:
+    //    the related CLOSE MUST still succeed.
+    let statuses = send_create_query_close(&mut s, session_id, tree_id, 7, "hello.txt", 0xFF).await;
+    assert_eq!(statuses[0], STATUS_SUCCESS, "CREATE of an existing file");
+    assert_ne!(
+        statuses[1], STATUS_SUCCESS,
+        "QUERY_INFO class 0xFF must fail"
+    );
+    assert_eq!(
+        statuses[2], STATUS_SUCCESS,
+        "a failed follow-up must not fail the CLOSE of a successful CREATE"
+    );
+
+    drop(s);
+    handle.abort();
+}
+
+const STATUS_FILE_CLOSED: u32 = 0xC000_0128;
+
+/// Sends one compound CREATE(`name`) + related QUERY_INFO(`info_class`) +
+/// related CLOSE and returns the three response statuses in order.
+async fn send_create_query_close(
+    s: &mut TcpStream,
+    session_id: u64,
+    tree_id: u32,
+    first_message_id: u64,
+    name: &str,
+    info_class: u8,
+) -> [u32; 3] {
+    let name_u16 = utf16le(name);
+    let create_req = CreateRequest {
+        structure_size: 57,
+        security_flags: 0,
+        requested_oplock_level: 0,
+        impersonation_level: 2,
+        smb_create_flags: 0,
+        reserved: 0,
+        desired_access: 0x0012_0089,
+        file_attributes: 0,
+        share_access: 0x0000_0007,
+        create_disposition: 1,
+        create_options: 0,
+        name_offset: 0x78,
+        name_length: name_u16.len() as u16,
+        create_contexts_offset: 0,
+        create_contexts_length: 0,
+        name: name_u16,
+        create_contexts: vec![],
+    };
+    let mut create_body = Vec::new();
+    create_req.write_to(&mut create_body).expect("write");
+    let mut create_hdr = build_header(Command::Create, first_message_id, session_id, tree_id);
+
+    let qi_req = QueryInfoRequest {
+        structure_size: 41,
+        info_type: InfoType::File as u8,
+        file_information_class: info_class,
+        output_buffer_length: 4096,
+        input_buffer_offset: 0,
+        reserved: 0,
+        input_buffer_length: 0,
+        additional_information: 0,
+        flags: 0,
+        file_id: FileId::any(),
+        input_buffer: vec![],
+    };
+    let mut qi_body = Vec::new();
+    qi_req.write_to(&mut qi_body).expect("write");
+    let mut qi_hdr = build_header(Command::QueryInfo, first_message_id + 1, u64::MAX, u32::MAX);
+    qi_hdr.flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+
+    let close_req = CloseRequest {
+        structure_size: 24,
+        flags: 0,
+        reserved: 0,
+        file_id: FileId::any(),
+    };
+    let mut close_body = Vec::new();
+    close_req.write_to(&mut close_body).expect("write");
+    let mut close_hdr = build_header(Command::Close, first_message_id + 2, u64::MAX, u32::MAX);
+    close_hdr.flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+
+    let mut compound = Vec::new();
+    append_compound_part(&mut compound, &mut create_hdr, &create_body, true);
+    append_compound_part(&mut compound, &mut qi_hdr, &qi_body, true);
+    append_compound_part(&mut compound, &mut close_hdr, &close_body, false);
+    let mut framed = Vec::new();
+    encode_frame(&compound, &mut framed);
+    s.write_all(&framed).await.expect("write compound");
+
+    let resp = read_frame(s).await;
+    let mut statuses = [0u32; 3];
+    let mut offset = 0usize;
+    for (i, expected) in [Command::Create, Command::QueryInfo, Command::Close]
+        .into_iter()
+        .enumerate()
+    {
+        let (hdr, _) = parse_response_header(&resp[offset..]);
+        assert_eq!(hdr.command, expected);
+        statuses[i] = hdr.channel_sequence_status;
+        offset += hdr.next_command as usize;
+    }
+    statuses
+}
+
 fn append_compound_part(
     compound: &mut Vec<u8>,
     header: &mut Smb2Header,
