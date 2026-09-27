@@ -32,6 +32,7 @@ const MAX_ALLOWED: u32 = 0x0200_0000;
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
+const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 /// What a CREATE's `DesiredAccess` mask says, split into the two levels a
 /// backend actually needs.
@@ -178,6 +179,10 @@ pub async fn handle(
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
     let delete_on_close = req.create_options & FILE_DELETE_ON_CLOSE != 0;
+    // `FILE_OPEN_REPARSE_POINT` asks the backend to open the link itself
+    // rather than its target. Backends that do not surface reparse points
+    // ignore it, keeping the pre-existing follow-the-link semantics (A2).
+    let open_reparse_point = req.create_options & FILE_OPEN_REPARSE_POINT != 0;
 
     let opts = OpenOptions {
         read: want_read || !want_write,
@@ -188,6 +193,7 @@ pub async fn handle(
         directory,
         non_directory,
         delete_on_close,
+        open_reparse_point,
     };
 
     // Parsed once, used both for the trace (if armed) and for any create
@@ -452,6 +458,7 @@ mod tests {
     use crate::proto::header::HeaderTail;
     use crate::server::{ServerConfig, ServerState, ServerUsers, ShareBindings, ShareMode};
     use crate::tests::memfs::MemFsBackend;
+    use async_trait::async_trait;
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -472,6 +479,15 @@ mod tests {
     /// A connection with one anonymous session and one tree bound to a
     /// fresh `MemFsBackend`. Returns `(conn, session_id, tree_id)`.
     async fn test_conn_with_tree(backend: MemFsBackend) -> (Arc<Connection>, u64, u32) {
+        test_conn_with_backend(backend).await
+    }
+
+    /// As [`test_conn_with_tree`], for any backend — used by the
+    /// `open_reparse_point` derivation test, which needs to observe the
+    /// `OpenOptions` the handler passes down.
+    async fn test_conn_with_backend<B: crate::backend::ShareBackend + 'static>(
+        backend: B,
+    ) -> (Arc<Connection>, u64, u32) {
         let conn = Arc::new(Connection::new(1, Uuid::nil(), 1024 * 1024, 1024 * 1024));
         let session = Session::new(1, Identity::Anonymous, [0; 16], [0; 16], false, None);
         let session = Arc::new(tokio::sync::RwLock::new(session));
@@ -888,6 +904,70 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Wraps a `MemFsBackend`, recording every `OpenOptions` a CREATE passes
+    /// down — the only way to observe the `open_reparse_point` derivation
+    /// from `create_options` at the handler boundary.
+    struct OptsRecorder {
+        inner: MemFsBackend,
+        seen: Arc<std::sync::Mutex<Vec<OpenOptions>>>,
+    }
+
+    #[async_trait]
+    impl crate::backend::ShareBackend for OptsRecorder {
+        async fn open(
+            &self,
+            path: &SmbPath,
+            opts: OpenOptions,
+        ) -> crate::error::SmbResult<Box<dyn crate::backend::Handle>> {
+            self.seen.lock().unwrap().push(opts);
+            self.inner.open(path, opts).await
+        }
+        async fn unlink(&self, path: &SmbPath) -> crate::error::SmbResult<()> {
+            self.inner.unlink(path).await
+        }
+        async fn rename(
+            &self,
+            from: &SmbPath,
+            to: &SmbPath,
+            replace: bool,
+        ) -> crate::error::SmbResult<()> {
+            self.inner.rename(from, to, replace).await
+        }
+        fn capabilities(&self) -> crate::backend::BackendCapabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    #[tokio::test]
+    async fn open_reparse_point_is_derived_from_create_options() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = OptsRecorder {
+            inner: MemFsBackend::new(),
+            seen: seen.clone(),
+        };
+        let server = test_server();
+        let (conn, session_id, tree_id) = test_conn_with_backend(backend).await;
+        let hdr = create_header(session_id, tree_id);
+
+        let plain = create_request_bytes("plain.txt", 0, FILE_CREATE);
+        assert_eq!(
+            handle(&server, &conn, &hdr, &plain).await.status,
+            ntstatus::STATUS_SUCCESS
+        );
+        let link = create_request_bytes("link.txt", FILE_OPEN_REPARSE_POINT, FILE_CREATE);
+        assert_eq!(
+            handle(&server, &conn, &hdr, &link).await.status,
+            ntstatus::STATUS_SUCCESS
+        );
+
+        let seen = seen.lock().unwrap();
+        assert!(!seen[0].open_reparse_point, "no create option → false");
+        assert!(
+            seen[1].open_reparse_point,
+            "FILE_OPEN_REPARSE_POINT (0x0020_0000) must set the flag"
+        );
     }
 
     #[tokio::test]

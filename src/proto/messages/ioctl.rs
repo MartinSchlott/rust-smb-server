@@ -28,6 +28,10 @@ pub enum Fsctl {
     LmrRequestResiliency,
     /// `FSCTL_QUERY_NETWORK_INTERFACE_INFO`.
     QueryNetworkInterfaceInfo,
+    /// `FSCTL_SET_REPARSE_POINT`.
+    SetReparsePoint,
+    /// `FSCTL_GET_REPARSE_POINT`.
+    GetReparsePoint,
     /// Anything else.
     Other(u32),
 }
@@ -41,6 +45,8 @@ impl Fsctl {
     pub const PIPE_WAIT: u32 = 0x0011_C018;
     pub const LMR_REQUEST_RESILIENCY: u32 = 0x001C_0017;
     pub const QUERY_NETWORK_INTERFACE_INFO: u32 = 0x001F_C017;
+    pub const SET_REPARSE_POINT: u32 = 0x0009_00A4;
+    pub const GET_REPARSE_POINT: u32 = 0x0009_00A8;
 
     pub fn from_u32(code: u32) -> Self {
         match code {
@@ -52,6 +58,8 @@ impl Fsctl {
             Self::PIPE_WAIT => Self::PipeWait,
             Self::LMR_REQUEST_RESILIENCY => Self::LmrRequestResiliency,
             Self::QUERY_NETWORK_INTERFACE_INFO => Self::QueryNetworkInterfaceInfo,
+            Self::SET_REPARSE_POINT => Self::SetReparsePoint,
+            Self::GET_REPARSE_POINT => Self::GetReparsePoint,
             other => Self::Other(other),
         }
     }
@@ -66,6 +74,8 @@ impl Fsctl {
             Self::PipeWait => Self::PIPE_WAIT,
             Self::LmrRequestResiliency => Self::LMR_REQUEST_RESILIENCY,
             Self::QueryNetworkInterfaceInfo => Self::QUERY_NETWORK_INTERFACE_INFO,
+            Self::SetReparsePoint => Self::SET_REPARSE_POINT,
+            Self::GetReparsePoint => Self::GET_REPARSE_POINT,
             Self::Other(c) => c,
         }
     }
@@ -155,8 +165,12 @@ mod tests {
     #[test]
     fn fsctl_decode_known() {
         assert_eq!(Fsctl::from_u32(0x0014_0204), Fsctl::ValidateNegotiateInfo);
+        assert_eq!(Fsctl::from_u32(0x0009_00A4), Fsctl::SetReparsePoint);
+        assert_eq!(Fsctl::from_u32(0x0009_00A8), Fsctl::GetReparsePoint);
         assert_eq!(Fsctl::from_u32(0xDEAD_BEEF), Fsctl::Other(0xDEAD_BEEF));
         assert_eq!(Fsctl::ValidateNegotiateInfo.as_u32(), 0x0014_0204);
+        assert_eq!(Fsctl::SetReparsePoint.as_u32(), 0x0009_00A4);
+        assert_eq!(Fsctl::GetReparsePoint.as_u32(), 0x0009_00A8);
         assert_eq!(Fsctl::Other(0xDEAD_BEEF).as_u32(), 0xDEAD_BEEF);
     }
 

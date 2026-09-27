@@ -167,6 +167,10 @@ fn file_info_from_metadata(name: String, md: &cap_std::fs::Metadata) -> FileInfo
         last_write_time: system_time_to_filetime(modified),
         change_time: system_time_to_filetime(modified),
         is_directory: md.is_dir(),
+        // `LocalFsBackend` does not implement `Handle::read_link`/
+        // `set_symlink`, so it never reports a link and keeps
+        // `supports_symlinks: false`.
+        is_symlink: false,
         // `cap-std` does not expose a stable inode-style identifier in its
         // public API; the dispatcher substitutes the FileId where needed.
         file_index: 0,
@@ -413,6 +417,8 @@ impl ShareBackend for LocalFsBackend {
             // emulate case-insensitive lookup in v1 (see spec §3.4).
             case_sensitive: cfg!(any(target_os = "linux", target_os = "freebsd")),
             supports_named_streams: true,
+            // This backend does not implement the reparse-point surface.
+            supports_symlinks: false,
         }
     }
 }
@@ -775,6 +781,7 @@ mod tests {
             delete_on_close: false,
             read_data: true,
             write_data: true,
+            open_reparse_point: false,
         }
     }
 
@@ -788,6 +795,7 @@ mod tests {
             delete_on_close: false,
             read_data: true,
             write_data: true,
+            open_reparse_point: false,
         }
     }
 
@@ -801,6 +809,7 @@ mod tests {
             delete_on_close: false,
             read_data: true,
             write_data: false,
+            open_reparse_point: false,
         }
     }
 
@@ -814,6 +823,7 @@ mod tests {
             delete_on_close: false,
             read_data: true,
             write_data: false,
+            open_reparse_point: false,
         }
     }
 

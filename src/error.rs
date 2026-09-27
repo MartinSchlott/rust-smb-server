@@ -33,6 +33,8 @@ pub enum SmbError {
     Sharing,
     #[error("not supported")]
     NotSupported,
+    #[error("not a reparse point")]
+    NotAReparsePoint,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -51,6 +53,7 @@ impl SmbError {
             SmbError::NameInvalid => ntstatus::STATUS_OBJECT_NAME_INVALID,
             SmbError::Sharing => ntstatus::STATUS_SHARING_VIOLATION,
             SmbError::NotSupported => ntstatus::STATUS_NOT_SUPPORTED,
+            SmbError::NotAReparsePoint => ntstatus::STATUS_NOT_A_REPARSE_POINT,
             SmbError::Io(_) => ntstatus::STATUS_UNEXPECTED_IO_ERROR,
         }
     }
@@ -72,6 +75,7 @@ mod tests {
         assert_eq!(SmbError::NameInvalid.to_nt_status(), 0xC000_0033);
         assert_eq!(SmbError::Sharing.to_nt_status(), 0xC000_0043);
         assert_eq!(SmbError::NotSupported.to_nt_status(), 0xC000_00BB);
+        assert_eq!(SmbError::NotAReparsePoint.to_nt_status(), 0xC000_0275);
 
         let io_err = SmbError::Io(std::io::Error::other("boom"));
         assert_eq!(io_err.to_nt_status(), 0xC000_009C);

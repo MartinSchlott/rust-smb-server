@@ -55,6 +55,11 @@ pub struct OpenOptions {
     /// also set by `FILE_WRITE_ATTRIBUTES` and by `DELETE` — neither of which
     /// implies any right to the file's contents.
     pub write_data: bool,
+    /// `FILE_OPEN_REPARSE_POINT` (`0x0020_0000`) was set on CREATE: open the
+    /// reparse point itself, not its target. A backend that presents symlinks
+    /// as reparse points uses this to hand back a link handle rather than
+    /// following the link server-side.
+    pub open_reparse_point: bool,
 }
 
 impl Default for OpenOptions {
@@ -68,6 +73,7 @@ impl Default for OpenOptions {
             delete_on_close: false,
             read_data: true,
             write_data: false,
+            open_reparse_point: false,
         }
     }
 }
@@ -94,6 +100,11 @@ pub struct FileInfo {
     pub change_time: u64,
     /// True if this is a directory.
     pub is_directory: bool,
+    /// True if this entry is a symlink presented as a reparse point. Set only
+    /// by a backend that advertises `BackendCapabilities::supports_symlinks`;
+    /// the macOS client treats an entry carrying `FILE_ATTRIBUTE_REPARSE_POINT`
+    /// and an `EaSize` of `IO_REPARSE_TAG_SYMLINK` as a link.
+    pub is_symlink: bool,
     /// Optional 64-bit unique file id (for `FileInternalInformation`). v1 may
     /// return `0` if unavailable; the dispatcher will substitute the FileId.
     pub file_index: u64,
@@ -107,7 +118,17 @@ impl FileInfo {
     pub fn attributes(&self) -> u32 {
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
         const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
-        if self.is_directory {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if self.is_symlink {
+            // MS-FSCC §2.6: `FILE_ATTRIBUTE_REPARSE_POINT` MUST NOT be
+            // combined with `FILE_ATTRIBUTE_NORMAL`. The directory bit is
+            // ORed in when the link's target is a directory.
+            let mut attrs = FILE_ATTRIBUTE_REPARSE_POINT;
+            if self.is_directory {
+                attrs |= FILE_ATTRIBUTE_DIRECTORY;
+            }
+            attrs
+        } else if self.is_directory {
             FILE_ATTRIBUTE_DIRECTORY
         } else {
             FILE_ATTRIBUTE_NORMAL
@@ -175,6 +196,15 @@ pub struct BackendCapabilities {
     /// AFPInfo/Finder-info/xattr writes) into the primary data stream —
     /// see `docs/SMB_DEFECTS.md` S2/S10 in the prosopon consumer.
     pub supports_named_streams: bool,
+    /// True iff the backend implements `Handle::read_link`/`set_symlink` and
+    /// presents symlinks as `IO_REPARSE_TAG_SYMLINK` reparse points.
+    /// Advertised to clients as `FILE_SUPPORTS_REPARSE_POINTS` (MS-FSCC
+    /// §2.5.1). MUST be set only by a backend that honours both
+    /// `FSCTL_GET_REPARSE_POINT` and `FSCTL_SET_REPARSE_POINT`: once the bit
+    /// is advertised, a macOS client stops writing Minshall-French XSym files
+    /// and sends `SET_REPARSE_POINT` instead, and it does **not** fall back to
+    /// XSym when that fails.
+    pub supports_symlinks: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +280,23 @@ pub trait Handle: Send + Sync {
         Ok(None)
     }
 
+    /// The target of the symlink this handle was opened on — the
+    /// `FSCTL_GET_REPARSE_POINT` answer. The target is returned in POSIX form
+    /// (`/` separators); the protocol layer converts it to the wire's
+    /// backslash form. Backends that do not present symlinks as reparse
+    /// points leave the default: `Err(SmbError::NotAReparsePoint)`.
+    async fn read_link(&self) -> SmbResult<String> {
+        Err(SmbError::NotAReparsePoint)
+    }
+
+    /// Replace the object this handle was opened on with a symlink to
+    /// `target` — the `FSCTL_SET_REPARSE_POINT` answer. `target` is in POSIX
+    /// form (`/` separators). Backends that do not present symlinks as
+    /// reparse points leave the default: `Err(SmbError::NotSupported)`.
+    async fn set_symlink(&self, _target: &str) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
+
     /// Close the handle. Boxed self lets implementors consume internal state.
     async fn close(self: Box<Self>) -> SmbResult<()>;
 }
@@ -275,6 +322,7 @@ impl ShareBackend for NotSupportedBackend {
             is_read_only: true,
             case_sensitive: false,
             supports_named_streams: false,
+            supports_symlinks: false,
         }
     }
 }

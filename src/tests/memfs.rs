@@ -15,6 +15,9 @@ use bytes::Bytes;
 /// within one test.
 pub struct MemFsBackend {
     inner: std::sync::Arc<Mutex<MemInner>>,
+    /// Advertised `supports_symlinks`. Default `false`; tests that exercise
+    /// the reparse-point advertisement flip it with [`Self::with_symlinks`].
+    supports_symlinks: bool,
 }
 
 #[derive(Default)]
@@ -41,6 +44,7 @@ impl MemFsBackend {
         inner.dirs.insert(String::new(), ());
         Self {
             inner: std::sync::Arc::new(Mutex::new(inner)),
+            supports_symlinks: false,
         }
     }
 
@@ -49,6 +53,13 @@ impl MemFsBackend {
             let mut g = self.inner.lock().unwrap();
             g.files.insert(path.to_string(), contents.to_vec());
         }
+        self
+    }
+
+    /// Sets the advertised `supports_symlinks`, so a QUERY_INFO test can
+    /// assert the `FILE_SUPPORTS_REPARSE_POINTS` bit tracks the capability.
+    pub fn with_symlinks(mut self, yes: bool) -> Self {
+        self.supports_symlinks = yes;
         self
     }
 }
@@ -251,6 +262,7 @@ impl ShareBackend for MemFsBackend {
             is_read_only: false,
             case_sensitive: false,
             supports_named_streams: true,
+            supports_symlinks: self.supports_symlinks,
         }
     }
 }
@@ -367,6 +379,7 @@ impl Handle for MemHandle {
             last_write_time: 0x01D9_0000_0000_0000,
             change_time: 0x01D9_0000_0000_0000,
             is_directory: self.is_dir,
+            is_symlink: false,
             file_index: 0,
         })
     }
@@ -416,6 +429,7 @@ impl Handle for MemHandle {
                         last_write_time: 0x01D9_0000_0000_0000,
                         change_time: 0x01D9_0000_0000_0000,
                         is_directory: false,
+                        is_symlink: false,
                         file_index: 0,
                     },
                 });
@@ -436,6 +450,7 @@ impl Handle for MemHandle {
                         last_write_time: 0x01D9_0000_0000_0000,
                         change_time: 0x01D9_0000_0000_0000,
                         is_directory: true,
+                        is_symlink: false,
                         file_index: 0,
                     },
                 });
@@ -665,6 +680,7 @@ mod tests {
             delete_on_close: false,
             read_data: true,
             write_data: true,
+            open_reparse_point: false,
         }
     }
 
@@ -678,6 +694,7 @@ mod tests {
             delete_on_close: false,
             read_data: true,
             write_data: true,
+            open_reparse_point: false,
         }
     }
 
@@ -824,6 +841,7 @@ mod tests {
             last_write_time: 0x01D9_0000_0000_0000,
             change_time: 0x01D9_0000_0000_0000,
             is_directory: false,
+            is_symlink: false,
             file_index: 1,
         }
     }

@@ -409,6 +409,22 @@ pub fn encode_minimal_security_descriptor() -> Vec<u8> {
 // Directory information classes (MS-FSCC §2.4.{8,14,17,30,31})
 // ---------------------------------------------------------------------------
 
+/// `IO_REPARSE_TAG_SYMLINK` — written into a directory entry's `EaSize` field
+/// when the entry is a symlink reparse point. MS-FSCC: for an entry carrying
+/// `FILE_ATTRIBUTE_REPARSE_POINT`, `EaSize` holds the reparse tag. The macOS
+/// client reads the tag from here to present the entry as a link.
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+/// The `EaSize` field for `info`: the symlink reparse tag for a link, `0`
+/// otherwise.
+fn ea_size(info: &FileInfo) -> u32 {
+    if info.is_symlink {
+        IO_REPARSE_TAG_SYMLINK
+    } else {
+        0
+    }
+}
+
 /// Encode a single FileBothDirectoryInformation entry. Returns the encoded
 /// bytes. The caller patches `NextEntryOffset` for chained entries.
 pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8> {
@@ -425,14 +441,14 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8>
         FILE_FULL_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
             write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
-            out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+            out.extend_from_slice(&ea_size(info).to_le_bytes()); // EaSize
             out.extend_from_slice(&name_u16);
             out
         }
         FILE_BOTH_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
             write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
-            out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+            out.extend_from_slice(&ea_size(info).to_le_bytes()); // EaSize
             out.push(0); // ShortNameLength
             out.push(0); // Reserved1
             // ShortName: 24 bytes (12 UTF-16 chars).
@@ -443,7 +459,7 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8>
         FILE_ID_BOTH_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
             write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
-            out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+            out.extend_from_slice(&ea_size(info).to_le_bytes()); // EaSize
             out.push(0); // ShortNameLength
             out.push(0); // Reserved1
             out.extend_from_slice(&[0u8; 24]); // ShortName
@@ -455,7 +471,7 @@ pub fn encode_dir_entry(class: u8, entry: &DirEntry, file_index: u64) -> Vec<u8>
         FILE_ID_FULL_DIRECTORY_INFORMATION => {
             let mut out = Vec::new();
             write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
-            out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+            out.extend_from_slice(&ea_size(info).to_le_bytes()); // EaSize
             out.extend_from_slice(&0u32.to_le_bytes()); // Reserved
             out.extend_from_slice(&file_index.to_le_bytes()); // FileId
             out.extend_from_slice(&name_u16);
@@ -505,6 +521,7 @@ mod tests {
             last_write_time: 0x01D9_0000_0000_0000,
             change_time: 0x01D9_0000_0000_0000,
             is_directory: false,
+            is_symlink: false,
             file_index: 1,
         }
     }
@@ -542,5 +559,62 @@ mod tests {
         assert_eq!(sd[0], 0x01);
         let control = u16::from_le_bytes([sd[2], sd[3]]);
         assert!(control & 0x8000 != 0);
+    }
+
+    fn dir_entry(info: FileInfo) -> DirEntry {
+        DirEntry { info }
+    }
+
+    /// `FILE_FULL_DIRECTORY_INFORMATION`'s prefix is 64 bytes (through
+    /// `FileNameLength`), so `EaSize` sits at offset 64 and `FileAttributes`
+    /// at 56.
+    #[test]
+    fn full_directory_entry_carries_the_symlink_tag_and_reparse_attribute() {
+        let mut info = fake_info();
+        info.is_symlink = true;
+        let bytes = encode_dir_entry(FILE_FULL_DIRECTORY_INFORMATION, &dir_entry(info), 1);
+
+        let attributes = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
+        assert_eq!(
+            attributes, 0x0000_0400,
+            "a reparse entry carries FILE_ATTRIBUTE_REPARSE_POINT and NOT FILE_ATTRIBUTE_NORMAL"
+        );
+        let ea_size = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
+        assert_eq!(ea_size, 0xA000_000C, "EaSize holds IO_REPARSE_TAG_SYMLINK");
+    }
+
+    #[test]
+    fn full_directory_entry_is_unchanged_for_a_non_link() {
+        let bytes = encode_dir_entry(FILE_FULL_DIRECTORY_INFORMATION, &dir_entry(fake_info()), 1);
+        let attributes = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
+        assert_eq!(attributes, 0x0000_0080);
+        let ea_size = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
+        assert_eq!(ea_size, 0);
+    }
+
+    #[test]
+    fn attributes_combine_the_directory_bit_for_a_directory_link() {
+        let mut info = fake_info();
+        info.is_directory = true;
+        info.is_symlink = true;
+        assert_eq!(info.attributes(), 0x0000_0410);
+    }
+
+    #[test]
+    fn every_directory_encoder_writes_the_tag_for_a_symlink() {
+        let mut info = fake_info();
+        info.is_symlink = true;
+        for class in [
+            FILE_FULL_DIRECTORY_INFORMATION,
+            FILE_BOTH_DIRECTORY_INFORMATION,
+            FILE_ID_BOTH_DIRECTORY_INFORMATION,
+            FILE_ID_FULL_DIRECTORY_INFORMATION,
+        ] {
+            let bytes = encode_dir_entry(class, &dir_entry(info.clone()), 1);
+            // `EaSize` is the first 4-byte field after the 64-byte prefix in
+            // every one of the four encoders.
+            let ea_size = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
+            assert_eq!(ea_size, 0xA000_000C, "class {class:#x}");
+        }
     }
 }

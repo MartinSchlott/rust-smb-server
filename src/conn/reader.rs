@@ -323,6 +323,7 @@ mod tests {
                 last_write_time: 0,
                 change_time: 0,
                 is_directory: false,
+                is_symlink: false,
                 file_index: 0,
             })
         }

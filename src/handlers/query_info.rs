@@ -24,6 +24,7 @@ const FILE_FILE_COMPRESSION: u32 = 0x0000_0010;
 const FILE_SUPPORTS_HARD_LINKS: u32 = 0x0040_0000;
 const FILE_SUPPORTS_EXTENDED_ATTRIBUTES: u32 = 0x0080_0000;
 const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
+const FILE_SUPPORTS_REPARSE_POINTS: u32 = 0x0000_0080;
 
 pub async fn handle(
     server: &Arc<ServerState>,
@@ -177,6 +178,17 @@ pub async fn handle(
                         | FILE_SUPPORTS_EXTENDED_ATTRIBUTES;
                     if backend.capabilities().supports_named_streams {
                         attrs |= FILE_NAMED_STREAMS;
+                    }
+                    // `FILE_SUPPORTS_REPARSE_POINTS` MUST be advertised only
+                    // by a backend that honours both reparse FSCTLs (MS-FSCC
+                    // §2.5.1). Once the bit is set the macOS client stops
+                    // writing Minshall-French XSym files and sends
+                    // `FSCTL_SET_REPARSE_POINT` on `ln -s`; it does **not**
+                    // fall back to XSym when that fails, so advertising the
+                    // bit without the handler turns a silent artifact into a
+                    // hard `ENOTSUP`.
+                    if backend.capabilities().supports_symlinks {
+                        attrs |= FILE_SUPPORTS_REPARSE_POINTS;
                     }
                     ic::encode_fs_attribute_information(attrs, 255, "NTFS")
                 }
@@ -370,6 +382,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fs_attribute_information_advertises_reparse_points_only_when_supported() {
+        let server = test_server();
+        let (conn, session_id, tree_id) =
+            test_conn_with_tree(MemFsBackend::new().with_symlinks(true)).await;
+        let file_id = open_root(&server, &conn, session_id, tree_id).await;
+        let hdr = header(
+            session_id,
+            tree_id,
+            2,
+            crate::proto::header::Command::QueryInfo,
+        );
+
+        let resp = handle(&server, &conn, &hdr, &fs_attribute_query(file_id)).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
+        let qresp = QueryInfoResponse::parse(&resp.body).unwrap();
+        let attrs = u32::from_le_bytes(qresp.buffer[0..4].try_into().unwrap());
+        assert_ne!(
+            attrs & FILE_SUPPORTS_REPARSE_POINTS,
+            0,
+            "a backend that honours the reparse FSCTLs must advertise the bit"
+        );
+
+        // The same query against the default (no-symlink) backend must not.
+        let server = test_server();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let file_id = open_root(&server, &conn, session_id, tree_id).await;
+        let hdr = header(
+            session_id,
+            tree_id,
+            2,
+            crate::proto::header::Command::QueryInfo,
+        );
+        let resp = handle(&server, &conn, &hdr, &fs_attribute_query(file_id)).await;
+        let qresp = QueryInfoResponse::parse(&resp.body).unwrap();
+        let attrs = u32::from_le_bytes(qresp.buffer[0..4].try_into().unwrap());
+        assert_eq!(
+            attrs & FILE_SUPPORTS_REPARSE_POINTS,
+            0,
+            "a backend without the reparse surface must not advertise the bit"
+        );
+    }
+
     // ── QUERY_INFO information type/class and stream enumeration (Step 1e) ──
 
     struct RecordingSink {
@@ -400,6 +455,7 @@ mod tests {
             delete_on_close: false,
             read_data: true,
             write_data: true,
+            open_reparse_point: false,
         }
     }
 
