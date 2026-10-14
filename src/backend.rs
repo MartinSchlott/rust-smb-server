@@ -284,7 +284,23 @@ pub trait Handle: Send + Sync {
     /// List directory entries matching the optional pattern. v1 ignores
     /// `pattern` if the backend doesn't implement matching — the dispatcher
     /// post-filters as needed for QUERY_DIRECTORY.
+    ///
+    /// A backend that *does* implement matching may answer
+    /// [`applies_pattern`][Self::applies_pattern] `true` to claim the filter
+    /// and suppress that post-filter.
     async fn list_dir(&self, pattern: Option<&str>) -> SmbResult<Vec<DirEntry>>;
+
+    /// A promise about pattern matching, consulted only when `list_dir` was
+    /// called with a pattern: answering `true` means the complete set
+    /// `list_dir(Some(pattern))` returns already satisfies `pattern` under
+    /// the backend's own matching, and nothing more needs filtering. The
+    /// QUERY_DIRECTORY handler then skips its own post-filter for this call.
+    /// The default, `false`, keeps the protocol layer's post-filter — which
+    /// is what a backend that ignores `pattern`, or matches differently from
+    /// the protocol's `dos_pattern_matches`, requires.
+    fn applies_pattern(&self, _pattern: &str) -> bool {
+        false
+    }
 
     /// The named streams attached to this handle's object. `None` means the
     /// backend does not track named streams for this object; the protocol layer

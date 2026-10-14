@@ -55,6 +55,15 @@ pub async fn handle(
             return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
         }
         if open.search_state.is_none() || restart {
+            // A backend may claim the filter for this pattern
+            // (`Handle::applies_pattern`): its `list_dir(Some(pattern))`
+            // result already satisfies `pattern` under its own matching, so
+            // the protocol-layer post-filter below is skipped. The default
+            // (`false`) keeps today's behaviour for every other backend.
+            let backend_prefiltered = match (open.handle.as_ref(), pattern.as_deref()) {
+                (Some(h), Some(pattern)) => h.applies_pattern(pattern),
+                _ => false,
+            };
             let entries = match open.handle.as_ref() {
                 Some(h) => h.list_dir(pattern.as_deref()).await,
                 None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
@@ -66,7 +75,9 @@ pub async fn handle(
             // `Handle::list_dir` permits backends to ignore `pattern`; the
             // protocol layer owns the final filter so an exact-name lookup
             // can never succeed with an unrelated sibling entry.
-            if let Some(pattern) = pattern.as_deref() {
+            if !backend_prefiltered
+                && let Some(pattern) = pattern.as_deref()
+            {
                 entries.retain(|entry| dos_pattern_matches(pattern, &entry.info.name));
             }
             open.search_state = Some(DirCursor {
@@ -167,7 +178,9 @@ mod tests {
         Arc::new(ServerState::new(config, users, vec![]))
     }
 
-    async fn test_conn_with_tree(backend: MemFsBackend) -> (Arc<Connection>, u64, u32) {
+    async fn test_conn_with_tree(
+        backend: Arc<dyn crate::backend::ShareBackend>,
+    ) -> (Arc<Connection>, u64, u32) {
         let conn = Arc::new(Connection::new(1, Uuid::nil(), 1024 * 1024, 1024 * 1024));
         let session = Arc::new(tokio::sync::RwLock::new(Session::new(
             1,
@@ -179,7 +192,7 @@ mod tests {
         )));
         let share = ShareBindings::new(
             "share".to_string(),
-            Arc::new(backend),
+            backend,
             ShareMode::Public,
             HashMap::new(),
             false,
@@ -277,7 +290,7 @@ mod tests {
         // first unrelated entry from a non-empty directory.
         let server = test_server();
         let backend = MemFsBackend::new().with_file("pre_existing.txt", b"old");
-        let (conn, session_id, tree_id) = test_conn_with_tree(backend).await;
+        let (conn, session_id, tree_id) = test_conn_with_tree(Arc::new(backend)).await;
         let file_id = open_root(&server, &conn, session_id, tree_id).await;
 
         let response = handle(
@@ -295,7 +308,7 @@ mod tests {
     async fn exact_name_lookup_is_ascii_case_insensitive() {
         let server = test_server();
         let backend = MemFsBackend::new().with_file("pre_existing.txt", b"old");
-        let (conn, session_id, tree_id) = test_conn_with_tree(backend).await;
+        let (conn, session_id, tree_id) = test_conn_with_tree(Arc::new(backend)).await;
         let file_id = open_root(&server, &conn, session_id, tree_id).await;
 
         let response = handle(
@@ -311,5 +324,191 @@ mod tests {
         let name_len = u32::from_le_bytes(response.buffer[60..64].try_into().unwrap()) as usize;
         let name_bytes = &response.buffer[104..104 + name_len];
         assert_eq!(utf16le_to_string(name_bytes), "pre_existing.txt");
+    }
+
+    // ── Backend-owned pattern matching (`Handle::applies_pattern`) ──────
+
+    use crate::backend::{
+        BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenOptions, ShareBackend,
+    };
+    use crate::error::{SmbError, SmbResult};
+    use crate::path::SmbPath;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+
+    /// A backend whose directory handle returns a fixed entry set regardless
+    /// of the pattern, and whose `applies_pattern` answer is configurable — so
+    /// a QUERY_DIRECTORY test can drive both the claimed-filter and the
+    /// default post-filter paths.
+    struct PatternBackend {
+        entries: Vec<DirEntry>,
+        claims: bool,
+    }
+
+    fn entry(name: &str) -> DirEntry {
+        DirEntry {
+            info: FileInfo {
+                name: name.to_string(),
+                end_of_file: 0,
+                allocation_size: 0,
+                creation_time: 0,
+                last_access_time: 0,
+                last_write_time: 0,
+                change_time: 0,
+                is_directory: false,
+                is_symlink: false,
+                file_index: 0,
+            },
+        }
+    }
+
+    struct PatternHandle {
+        entries: Vec<DirEntry>,
+        claims: bool,
+    }
+
+    #[async_trait]
+    impl ShareBackend for PatternBackend {
+        async fn open(&self, _path: &SmbPath, _opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+            Ok(Box::new(PatternHandle {
+                entries: self.entries.clone(),
+                claims: self.claims,
+            }))
+        }
+        async fn unlink(&self, _path: &SmbPath) -> SmbResult<()> {
+            Err(SmbError::NotSupported)
+        }
+        async fn rename(&self, _from: &SmbPath, _to: &SmbPath, _replace: bool) -> SmbResult<()> {
+            Err(SmbError::NotSupported)
+        }
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                is_read_only: true,
+                case_sensitive: false,
+                supports_named_streams: false,
+                supports_symlinks: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Handle for PatternHandle {
+        async fn read(&self, _offset: u64, _len: u32) -> SmbResult<Bytes> {
+            Err(SmbError::NotSupported)
+        }
+        async fn write(&self, _offset: u64, _data: &[u8]) -> SmbResult<u32> {
+            Err(SmbError::NotSupported)
+        }
+        async fn flush(&self) -> SmbResult<()> {
+            Ok(())
+        }
+        async fn stat(&self) -> SmbResult<FileInfo> {
+            Ok(FileInfo {
+                name: String::new(),
+                end_of_file: 0,
+                allocation_size: 0,
+                creation_time: 0,
+                last_access_time: 0,
+                last_write_time: 0,
+                change_time: 0,
+                is_directory: true,
+                is_symlink: false,
+                file_index: 0,
+            })
+        }
+        async fn set_times(&self, _times: FileTimes) -> SmbResult<()> {
+            Ok(())
+        }
+        async fn truncate(&self, _len: u64) -> SmbResult<()> {
+            Err(SmbError::NotSupported)
+        }
+        async fn list_dir(&self, _pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
+            Ok(self.entries.clone())
+        }
+        fn applies_pattern(&self, _pattern: &str) -> bool {
+            self.claims
+        }
+        async fn close(self: Box<Self>) -> SmbResult<()> {
+            Ok(())
+        }
+    }
+
+    fn first_entry_name(body: &[u8]) -> String {
+        let response = QueryDirectoryResponse::parse(body).unwrap();
+        let name_len = u32::from_le_bytes(response.buffer[60..64].try_into().unwrap()) as usize;
+        let name_bytes = &response.buffer[104..104 + name_len];
+        utf16le_to_string(name_bytes)
+    }
+
+    #[tokio::test]
+    async fn backend_claiming_the_pattern_bypasses_the_post_filter() {
+        // The pattern is lowercase NFD `überblick.md`; the entry is the
+        // precomposed `Überblick.md`. `dos_pattern_matches` compares ASCII
+        // characters case-insensitively and would drop the entry, so survival
+        // proves the protocol-layer filter was skipped for the claimed call.
+        let server = test_server();
+        let backend = PatternBackend {
+            entries: vec![entry("\u{00dc}berblick.md")],
+            claims: true,
+        };
+        let (conn, session_id, tree_id) = test_conn_with_tree(Arc::new(backend)).await;
+        let file_id = open_root(&server, &conn, session_id, tree_id).await;
+
+        let response = handle(
+            &server,
+            &conn,
+            &header(session_id, tree_id, 2, Command::QueryDirectory),
+            &exact_name_query(file_id, "u\u{0308}berblick.md"),
+        )
+        .await;
+
+        assert_eq!(response.status, ntstatus::STATUS_SUCCESS);
+        assert_eq!(first_entry_name(&response.body), "\u{00dc}berblick.md");
+    }
+
+    #[tokio::test]
+    async fn default_hook_post_filters_the_variant_entry() {
+        // Same backend and entries, but the default `applies_pattern` (false)
+        // keeps the protocol-layer post-filter: the variant spelling is
+        // dropped, so the exact-name lookup reports no more files.
+        let server = test_server();
+        let backend = PatternBackend {
+            entries: vec![entry("\u{00dc}berblick.md")],
+            claims: false,
+        };
+        let (conn, session_id, tree_id) = test_conn_with_tree(Arc::new(backend)).await;
+        let file_id = open_root(&server, &conn, session_id, tree_id).await;
+
+        let response = handle(
+            &server,
+            &conn,
+            &header(session_id, tree_id, 2, Command::QueryDirectory),
+            &exact_name_query(file_id, "u\u{0308}berblick.md"),
+        )
+        .await;
+
+        assert_eq!(response.status, ntstatus::STATUS_NO_MORE_FILES);
+    }
+
+    #[tokio::test]
+    async fn wildcard_pattern_is_still_post_filtered_under_the_default_hook() {
+        let server = test_server();
+        let backend = PatternBackend {
+            entries: vec![entry("a.md"), entry("b.txt")],
+            claims: false,
+        };
+        let (conn, session_id, tree_id) = test_conn_with_tree(Arc::new(backend)).await;
+        let file_id = open_root(&server, &conn, session_id, tree_id).await;
+
+        let response = handle(
+            &server,
+            &conn,
+            &header(session_id, tree_id, 2, Command::QueryDirectory),
+            &exact_name_query(file_id, "*.md"),
+        )
+        .await;
+
+        assert_eq!(response.status, ntstatus::STATUS_SUCCESS);
+        assert_eq!(first_entry_name(&response.body), "a.md");
     }
 }
