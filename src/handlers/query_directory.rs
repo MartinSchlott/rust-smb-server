@@ -75,9 +75,7 @@ pub async fn handle(
             // `Handle::list_dir` permits backends to ignore `pattern`; the
             // protocol layer owns the final filter so an exact-name lookup
             // can never succeed with an unrelated sibling entry.
-            if !backend_prefiltered
-                && let Some(pattern) = pattern.as_deref()
-            {
+            if !backend_prefiltered && let Some(pattern) = pattern.as_deref() {
                 entries.retain(|entry| dos_pattern_matches(pattern, &entry.info.name));
             }
             open.search_state = Some(DirCursor {
@@ -433,19 +431,33 @@ mod tests {
         }
     }
 
-    fn first_entry_name(body: &[u8]) -> String {
+    /// Every file name in a `FileIdBothDirectoryInformation` response chain,
+    /// in order — the complete returned set, not just the first entry.
+    fn all_entry_names(body: &[u8]) -> Vec<String> {
         let response = QueryDirectoryResponse::parse(body).unwrap();
-        let name_len = u32::from_le_bytes(response.buffer[60..64].try_into().unwrap()) as usize;
-        let name_bytes = &response.buffer[104..104 + name_len];
-        utf16le_to_string(name_bytes)
+        let buf = &response.buffer;
+        let mut names = Vec::new();
+        let mut off = 0usize;
+        loop {
+            let next = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+            let name_len = u32::from_le_bytes(buf[off + 60..off + 64].try_into().unwrap()) as usize;
+            names.push(utf16le_to_string(&buf[off + 104..off + 104 + name_len]));
+            if next == 0 {
+                break;
+            }
+            off += next;
+        }
+        names
     }
 
     #[tokio::test]
     async fn backend_claiming_the_pattern_bypasses_the_post_filter() {
         // The pattern is lowercase NFD `überblick.md`; the entry is the
         // precomposed `Überblick.md`. `dos_pattern_matches` compares ASCII
-        // characters case-insensitively and would drop the entry, so survival
-        // proves the protocol-layer filter was skipped for the claimed call.
+        // characters case-insensitively and would drop the entry, so its
+        // survival proves the protocol-layer filter was skipped for the
+        // claimed call. The complete returned set must be exactly the claimed
+        // entry — no unrelated sibling.
         let server = test_server();
         let backend = PatternBackend {
             entries: vec![entry("\u{00dc}berblick.md")],
@@ -463,7 +475,7 @@ mod tests {
         .await;
 
         assert_eq!(response.status, ntstatus::STATUS_SUCCESS);
-        assert_eq!(first_entry_name(&response.body), "\u{00dc}berblick.md");
+        assert_eq!(all_entry_names(&response.body), vec!["\u{00dc}berblick.md"]);
     }
 
     #[tokio::test]
@@ -509,6 +521,6 @@ mod tests {
         .await;
 
         assert_eq!(response.status, ntstatus::STATUS_SUCCESS);
-        assert_eq!(first_entry_name(&response.body), "a.md");
+        assert_eq!(all_entry_names(&response.body), vec!["a.md"]);
     }
 }
