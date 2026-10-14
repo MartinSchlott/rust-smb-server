@@ -224,6 +224,20 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// recursively delete.
     async fn unlink(&self, path: &SmbPath) -> SmbResult<()>;
 
+    /// Report whether a delete of `path` would be refused, without removing
+    /// anything. A backend that cannot tell returns `Ok(())`.
+    ///
+    /// The protocol layer consults this before a delete-on-close is recorded
+    /// (an `FileDispositionInformation` SET_INFO) or a `FILE_DELETE_ON_CLOSE`
+    /// CREATE is answered, so a delete the server can foresee to fail is
+    /// refused at the client's own request instead of being silently dropped
+    /// by the later CLOSE. A refusal returned here MUST use the same error
+    /// `unlink` would, so the status the client sees is the one the delete
+    /// would have produced.
+    async fn check_delete(&self, _path: &SmbPath) -> SmbResult<()> {
+        Ok(())
+    }
+
     /// Rename `from` to `to`. `replace` is MS-FSCC §2.4.37's
     /// `ReplaceIfExists`: `false` — the backend MUST reject if `to` already
     /// exists; `true` — the backend MUST replace `to` atomically if it

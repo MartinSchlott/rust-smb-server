@@ -101,8 +101,16 @@ pub async fn handle(
             if buffer.is_empty() {
                 return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
             }
+            let request_delete = buffer[0] != 0;
             let mut open = open_arc.write().await;
-            open.delete_on_close = buffer[0] != 0;
+            // A non-zero value asks for a delete-on-close. Refuse it here, at
+            // the client's request, when the backend can already tell the
+            // delete would fail; the flag stays unchanged and the later CLOSE
+            // performs nothing. A zero value clears the flag without a check.
+            if request_delete && let Err(e) = backend.check_delete(&open.last_path).await {
+                return HandlerResponse::err(e.to_nt_status());
+            }
+            open.delete_on_close = request_delete;
             Ok(())
         }
         ic::FILE_RENAME_INFORMATION => {
@@ -189,4 +197,104 @@ pub async fn handle(
         .write_to(&mut buf)
         .expect("encode");
     HandlerResponse::ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::header::Command;
+    use crate::tests::handler_support as hs;
+    use crate::tests::memfs::RefusingDeleteBackend;
+
+    const FILE_OPEN: u32 = 0x0000_0001;
+    const FILE_READ_DATA: u32 = 0x0000_0001;
+
+    /// Open `name` through the CREATE handler and return its FileId.
+    async fn open_existing(
+        server: &Arc<ServerState>,
+        conn: &Arc<Connection>,
+        session_id: u64,
+        tree_id: u32,
+        name: &str,
+    ) -> crate::proto::messages::create::FileId {
+        let body = hs::create_request(name, 0, FILE_OPEN, FILE_READ_DATA);
+        let hdr = hs::header(session_id, tree_id, Command::Create);
+        let resp = crate::handlers::dispatch_command(server, conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS, "setup: open {name}");
+        hs::sole_open(conn, session_id, tree_id).await.0
+    }
+
+    #[tokio::test]
+    async fn a_refused_disposition_leaves_the_flag_unset_and_nothing_is_deleted() {
+        let server = hs::test_server();
+        let backend = RefusingDeleteBackend::new().with_file("victim.txt", b"data");
+        backend.set_refuse_check_delete(true);
+        let observer = backend.clone();
+        let (conn, session_id, tree_id) = hs::test_conn_with_backend(backend).await;
+
+        let file_id = open_existing(&server, &conn, session_id, tree_id, "victim.txt").await;
+
+        let hdr = hs::header(session_id, tree_id, Command::SetInfo);
+        let body = hs::set_info_disposition(file_id, true);
+        let resp = handle(&server, &conn, &hdr, &body).await;
+        assert_eq!(
+            resp.status,
+            ntstatus::STATUS_DIRECTORY_NOT_EMPTY,
+            "the backend's refusal must reach the client at its request"
+        );
+
+        assert_eq!(observer.check_delete_call_count(), 1);
+        let (_, delete_on_close) = hs::sole_open(&conn, session_id, tree_id).await;
+        assert!(
+            !delete_on_close,
+            "a refused disposition must leave the flag unchanged"
+        );
+
+        // The later CLOSE has nothing to delete, and the file survives.
+        let hdr = hs::header(session_id, tree_id, Command::Close);
+        let body = hs::close_request(file_id);
+        let resp = crate::handlers::dispatch_command(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
+        assert!(
+            observer.has_file("victim.txt"),
+            "a delete the server refused must not later be performed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_disposition_sets_the_flag_and_a_refused_close_reports_it() {
+        let server = hs::test_server();
+        let backend = RefusingDeleteBackend::new().with_file("victim.txt", b"data");
+        // check_delete accepts (default), but the close-time unlink refuses.
+        backend.set_refuse_unlink(true);
+        let observer = backend.clone();
+        let (conn, session_id, tree_id) = hs::test_conn_with_backend(backend).await;
+
+        let file_id = open_existing(&server, &conn, session_id, tree_id, "victim.txt").await;
+
+        let hdr = hs::header(session_id, tree_id, Command::SetInfo);
+        let body = hs::set_info_disposition(file_id, true);
+        let resp = handle(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
+        assert!(
+            hs::sole_open(&conn, session_id, tree_id).await.1,
+            "an accepted disposition must set the flag"
+        );
+
+        let hdr = hs::header(session_id, tree_id, Command::Close);
+        let body = hs::close_request(file_id);
+        let resp = crate::handlers::dispatch_command(&server, &conn, &hdr, &body).await;
+        assert_eq!(
+            resp.status,
+            ntstatus::STATUS_DIRECTORY_NOT_EMPTY,
+            "a CLOSE-time delete failure must be reported, not answered as success"
+        );
+        assert_eq!(observer.unlink_call_count(), 1);
+        assert_eq!(
+            hs::open_count(&conn, session_id, tree_id).await,
+            0,
+            "the handle must still be closed and removed even though the delete failed"
+        );
+        assert!(observer.has_file("victim.txt"));
+    }
 }

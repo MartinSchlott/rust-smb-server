@@ -83,6 +83,10 @@ pub async fn handle(
         drop(tree);
         if let Err(e) = backend.unlink(&path).await {
             debug!(error = %e, "delete-on-close unlink failed");
+            // The handle is already closed and removed from the open table;
+            // the delete is not honoured, and the CLOSE reports why rather
+            // than answering success for a delete that did not happen.
+            return HandlerResponse::err(e.to_nt_status());
         }
     }
 
@@ -122,4 +126,43 @@ pub async fn handle(
     let mut buf = Vec::new();
     resp.write_to(&mut buf).expect("encode");
     HandlerResponse::ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::header::Command;
+    use crate::tests::handler_support as hs;
+    use crate::tests::memfs::MemFsBackend;
+
+    const FILE_CREATE: u32 = 0x0000_0002;
+    const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
+    const DELETE: u32 = 0x0001_0000;
+
+    /// A backend that keeps the default `check_delete` (returns `Ok`) must
+    /// delete on close exactly as it did before the preflight existed.
+    #[tokio::test]
+    async fn default_hook_delete_on_close_still_deletes_the_file() {
+        let server = hs::test_server();
+        let backend = MemFsBackend::new();
+        let observer = backend.clone();
+        let (conn, session_id, tree_id) = hs::test_conn_with_backend(backend).await;
+
+        let hdr = hs::header(session_id, tree_id, Command::Create);
+        let body = hs::create_request("tmp.txt", FILE_DELETE_ON_CLOSE, FILE_CREATE, DELETE);
+        let resp = crate::handlers::dispatch_command(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
+
+        let (file_id, delete_on_close) = hs::sole_open(&conn, session_id, tree_id).await;
+        assert!(delete_on_close);
+
+        let hdr = hs::header(session_id, tree_id, Command::Close);
+        let body = hs::close_request(file_id);
+        let resp = crate::handlers::dispatch_command(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
+        assert!(
+            !observer.has_file("tmp.txt"),
+            "the default hook leaves the delete-on-close behaviour unchanged"
+        );
+    }
 }

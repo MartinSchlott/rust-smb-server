@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::backend::{
     BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenIntent, OpenOptions,
@@ -12,7 +12,8 @@ use bytes::Bytes;
 
 /// Minimal in-memory FS used by integration tests. Files are byte vectors,
 /// directories are sets of names. Not threadsafe across workers — only used
-/// within one test.
+/// within one test. Cloning shares the same underlying store.
+#[derive(Clone)]
 pub struct MemFsBackend {
     inner: std::sync::Arc<Mutex<MemInner>>,
     /// Advertised `supports_symlinks`. Default `false`; tests that exercise
@@ -61,6 +62,11 @@ impl MemFsBackend {
     pub fn with_symlinks(mut self, yes: bool) -> Self {
         self.supports_symlinks = yes;
         self
+    }
+
+    /// Whether a file is present, for asserting what survived a delete.
+    pub fn has_file(&self, path: &str) -> bool {
+        self.inner.lock().unwrap().files.contains_key(path)
     }
 }
 
@@ -264,6 +270,103 @@ impl ShareBackend for MemFsBackend {
             supports_named_streams: true,
             supports_symlinks: self.supports_symlinks,
         }
+    }
+}
+
+/// A [`MemFsBackend`] wrapper whose `check_delete` and `unlink` can each be
+/// made to refuse with [`SmbError::NotEmpty`], so a handler test can drive the
+/// delete-preflight and CLOSE-failure paths without a real filesystem. Both
+/// calls are recorded, path by path, so a test can assert which ran. Its
+/// state is shared across clones, so a test keeps one clone to inspect while
+/// the server owns another.
+#[derive(Clone)]
+pub struct RefusingDeleteBackend {
+    inner: MemFsBackend,
+    refuse_check_delete: Arc<std::sync::atomic::AtomicBool>,
+    refuse_unlink: Arc<std::sync::atomic::AtomicBool>,
+    check_delete_calls: Arc<Mutex<Vec<String>>>,
+    unlink_calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl RefusingDeleteBackend {
+    pub fn new() -> Self {
+        Self {
+            inner: MemFsBackend::new(),
+            refuse_check_delete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            refuse_unlink: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            check_delete_calls: Arc::new(Mutex::new(Vec::new())),
+            unlink_calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn with_file(mut self, path: &str, contents: &[u8]) -> Self {
+        self.inner = self.inner.with_file(path, contents);
+        self
+    }
+
+    pub fn set_refuse_check_delete(&self, yes: bool) -> &Self {
+        self.refuse_check_delete
+            .store(yes, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    pub fn set_refuse_unlink(&self, yes: bool) -> &Self {
+        self.refuse_unlink
+            .store(yes, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    pub fn check_delete_call_count(&self) -> usize {
+        self.check_delete_calls.lock().unwrap().len()
+    }
+
+    pub fn unlink_call_count(&self) -> usize {
+        self.unlink_calls.lock().unwrap().len()
+    }
+
+    /// The underlying store, for asserting what survived a refused delete.
+    pub fn has_file(&self, path: &str) -> bool {
+        self.inner.inner.lock().unwrap().files.contains_key(path)
+    }
+}
+
+impl Default for RefusingDeleteBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ShareBackend for RefusingDeleteBackend {
+    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+        self.inner.open(path, opts).await
+    }
+
+    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+        self.unlink_calls.lock().unwrap().push(key(path));
+        if self.refuse_unlink.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SmbError::NotEmpty);
+        }
+        self.inner.unlink(path).await
+    }
+
+    async fn check_delete(&self, path: &SmbPath) -> SmbResult<()> {
+        self.check_delete_calls.lock().unwrap().push(key(path));
+        if self
+            .refuse_check_delete
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(SmbError::NotEmpty);
+        }
+        self.inner.check_delete(path).await
+    }
+
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
+        self.inner.rename(from, to, replace).await
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
     }
 }
 

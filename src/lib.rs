@@ -54,6 +54,7 @@ pub mod wire {
 #[cfg(test)]
 pub(crate) mod tests {
     mod dynamic_config;
+    pub(crate) mod handler_support;
     pub(crate) mod memfs;
     mod set_info_allocation;
 }

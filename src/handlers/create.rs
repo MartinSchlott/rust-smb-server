@@ -242,6 +242,15 @@ pub async fn handle(
         }
     };
 
+    // Refuse a `FILE_DELETE_ON_CLOSE` CREATE whose delete the backend can
+    // already see would fail, rather than letting the CLOSE silently drop it.
+    // The just-opened handle is closed and never entered into the open table.
+    if delete_on_close && let Err(e) = backend.check_delete(&path).await {
+        let _ = handle.close().await;
+        record_create_trace(None);
+        return HandlerResponse::err(e.to_nt_status());
+    }
+
     // Stat for the response.
     let info = match handle.stat().await {
         Ok(i) => i,
@@ -991,5 +1000,50 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // -- Delete-on-close preflight (PLAN_delete_refusal_reported) ----------
+
+    #[tokio::test]
+    async fn a_refused_delete_on_close_create_returns_the_status_and_leaves_no_open() {
+        let server = test_server();
+        let backend = crate::tests::memfs::RefusingDeleteBackend::new();
+        backend.set_refuse_check_delete(true);
+        let observer = backend.clone();
+        let (conn, session_id, tree_id) = test_conn_with_backend(backend).await;
+        let hdr = create_header(session_id, tree_id);
+
+        let body = create_request_bytes("tmp.txt", FILE_DELETE_ON_CLOSE, FILE_CREATE);
+        let resp = handle(&server, &conn, &hdr, &body).await;
+        assert_eq!(
+            resp.status,
+            ntstatus::STATUS_DIRECTORY_NOT_EMPTY,
+            "a FILE_DELETE_ON_CLOSE CREATE the backend can foresee to fail must be refused"
+        );
+        assert_eq!(observer.check_delete_call_count(), 1);
+        assert_eq!(
+            crate::tests::handler_support::open_count(&conn, session_id, tree_id).await,
+            0,
+            "the just-opened handle must not be entered into the open table"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_create_without_delete_on_close_is_never_preflighted() {
+        let server = test_server();
+        let backend = crate::tests::memfs::RefusingDeleteBackend::new();
+        backend.set_refuse_check_delete(true);
+        let observer = backend.clone();
+        let (conn, session_id, tree_id) = test_conn_with_backend(backend).await;
+        let hdr = create_header(session_id, tree_id);
+
+        let body = create_request_bytes("keep.txt", 0, FILE_CREATE);
+        let resp = handle(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
+        assert_eq!(
+            observer.check_delete_call_count(),
+            0,
+            "only a delete-on-close CREATE consults the preflight"
+        );
     }
 }
