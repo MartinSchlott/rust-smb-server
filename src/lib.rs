@@ -25,6 +25,8 @@ mod error;
 mod fs;
 mod handlers;
 pub(crate) mod info_class;
+mod lock;
+mod notify;
 pub mod ntstatus;
 mod path;
 mod proto;
@@ -41,6 +43,7 @@ pub use builder::{Access, Share};
 pub use error::{SmbError, SmbResult};
 #[cfg(feature = "localfs")]
 pub use fs::LocalFsBackend;
+pub use notify::{Change, ChangeNotifier, NotifyAction};
 pub use path::SmbPath;
 pub use proto::auth::ntlm::Identity;
 pub use server::{ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
@@ -56,5 +59,6 @@ pub(crate) mod tests {
     mod dynamic_config;
     pub(crate) mod handler_support;
     pub(crate) mod memfs;
+    mod notify_lock;
     mod set_info_allocation;
 }

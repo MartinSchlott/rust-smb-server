@@ -248,6 +248,13 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// Static capabilities. The dispatcher consults these at TREE_CONNECT and
     /// uses `is_read_only` to clamp authz.
     fn capabilities(&self) -> BackendCapabilities;
+
+    /// Where this backend reports changes made outside the server, for
+    /// CHANGE_NOTIFY. `None` (the default) answers CHANGE_NOTIFY with
+    /// `STATUS_NOT_SUPPORTED`, and the client polls.
+    fn change_notifier(&self) -> Option<crate::notify::ChangeNotifier> {
+        None
+    }
 }
 
 /// A live open file or directory handle.

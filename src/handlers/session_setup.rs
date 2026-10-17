@@ -146,6 +146,7 @@ pub async fn handle(
             override_session_id: Some(new_sid),
             skip_signing: true, // no key yet
             take_preauth_snapshot_for_session: None,
+            suppress: false,
         };
     }
 
@@ -239,6 +240,7 @@ pub async fn handle(
         // authenticated sessions get signed by the dispatcher's normal path.
         skip_signing: matches!(outcome.identity, Identity::Anonymous),
         take_preauth_snapshot_for_session: take_snapshot,
+        suppress: false,
     }
 }
 

@@ -59,6 +59,26 @@ pub struct Connection {
 
     /// Monotonic SessionId allocator.
     next_session_id: AtomicU64,
+
+    /// The connection's writer, for responses sent after the request's own
+    /// dispatch returned (async CHANGE_NOTIFY and LOCK completions). Taken
+    /// when the connection ends so the writer task can finish.
+    pub writer: Mutex<Option<tokio::sync::mpsc::Sender<crate::conn::writer::FramePayload>>>,
+    /// Requests answered `STATUS_PENDING`, by AsyncId.
+    pending: Mutex<HashMap<u64, Pending>>,
+    next_async_id: AtomicU64,
+}
+
+/// A request answered `STATUS_PENDING` whose final response is still owed.
+/// Whoever removes it from the table sends that response: the waiting task
+/// when its work is done, or CANCEL / CLOSE by sending the status down `done`.
+pub struct Pending {
+    pub message_id: u64,
+    /// `Open::lock_owner` of the open the request waits on.
+    pub owner: u64,
+    /// Status to complete with when that open closes.
+    pub on_close: u32,
+    pub done: tokio::sync::oneshot::Sender<u32>,
 }
 
 impl Connection {
@@ -81,7 +101,84 @@ impl Connection {
             pending_auths: RwLock::new(HashMap::new()),
             session_preauth: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
+            writer: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            next_async_id: AtomicU64::new(1),
         }
+    }
+
+    pub fn alloc_async_id(&self) -> u64 {
+        self.next_async_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Pending>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn add_pending(&self, async_id: u64, pending: Pending) {
+        self.pending().insert(async_id, pending);
+    }
+
+    /// Claim the right to send `async_id`'s final response.
+    pub fn take_pending(&self, async_id: u64) -> bool {
+        self.pending().remove(&async_id).is_some()
+    }
+
+    /// CANCEL (MS-SMB2 §3.3.5.16): by AsyncId when the request carries one,
+    /// otherwise by MessageId.
+    pub fn cancel(&self, async_id: Option<u64>, message_id: u64) {
+        let mut pending = self.pending();
+        let key = async_id.or_else(|| {
+            pending
+                .iter()
+                .find(|(_, p)| p.message_id == message_id)
+                .map(|(k, _)| *k)
+        });
+        if let Some(p) = key.and_then(|k| pending.remove(&k)) {
+            let _ = p.done.send(crate::ntstatus::STATUS_CANCELLED);
+        }
+    }
+
+    /// The open `owner` closed: release its locks and finish what waits on it.
+    pub fn open_closed(&self, share: &ShareBindings, owner: u64) {
+        // Pending first: a LOCK waiter that wins its range after this finds
+        // its request gone and gives the range back.
+        let mut pending = self.pending();
+        let keys: Vec<u64> = pending
+            .iter()
+            .filter(|(_, p)| p.owner == owner)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in keys {
+            if let Some(p) = pending.remove(&k) {
+                let _ = p.done.send(p.on_close);
+            }
+        }
+        drop(pending);
+        share.locks.release_owner(owner);
+    }
+
+    /// Send a frame outside a request's own dispatch.
+    pub async fn send(&self, bytes: Vec<u8>) {
+        let tx = self
+            .writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(tx) = tx {
+            let _ = tx.send(bytes).await;
+        }
+    }
+
+    /// The connection ended: close every session (each open's handle, locks,
+    /// and pending requests) and let the writer finish.
+    pub async fn teardown(&self) {
+        let ids: Vec<u64> = self.sessions.read().await.keys().copied().collect();
+        for id in ids {
+            self.close_session(id).await;
+        }
+        self.pending().clear();
+        self.writer.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     pub fn alloc_session_id(&self) -> u64 {
@@ -94,7 +191,7 @@ impl Connection {
             sessions.remove(&session_id)
         };
         if let Some(sess_arc) = removed {
-            close_session_state(&sess_arc).await;
+            close_session_state(self, &sess_arc).await;
             true
         } else {
             false
@@ -109,7 +206,7 @@ impl Connection {
         let Some(sess_arc) = sess_arc else {
             return false;
         };
-        remove_tree_from_session(&sess_arc, tree_id).await
+        remove_tree_from_session(self, &sess_arc, tree_id).await
     }
 
     pub async fn close_sessions_for_user(&self, user: &str) -> usize {
@@ -173,7 +270,7 @@ impl Connection {
             };
 
             for tree_id in tree_ids {
-                if remove_tree_from_session(&sess_arc, tree_id).await {
+                if remove_tree_from_session(self, &sess_arc, tree_id).await {
                     removed += 1;
                 }
             }
@@ -182,33 +279,38 @@ impl Connection {
     }
 }
 
-async fn close_session_state(sess_arc: &Arc<RwLock<Session>>) {
+async fn close_session_state(conn: &Connection, sess_arc: &Arc<RwLock<Session>>) {
     let sess = sess_arc.write().await;
     let trees: Vec<_> = sess.trees.write().await.drain().collect();
     for (_tree_id, tree_arc) in trees {
-        close_tree_state(&tree_arc).await;
+        close_tree_state(conn, &tree_arc).await;
     }
 }
 
-async fn remove_tree_from_session(sess_arc: &Arc<RwLock<Session>>, tree_id: u32) -> bool {
+async fn remove_tree_from_session(
+    conn: &Connection,
+    sess_arc: &Arc<RwLock<Session>>,
+    tree_id: u32,
+) -> bool {
     let removed = {
         let sess = sess_arc.read().await;
         let mut trees = sess.trees.write().await;
         trees.remove(&tree_id)
     };
     if let Some(tree_arc) = removed {
-        close_tree_state(&tree_arc).await;
+        close_tree_state(conn, &tree_arc).await;
         true
     } else {
         false
     }
 }
 
-async fn close_tree_state(tree_arc: &Arc<RwLock<TreeConnect>>) {
+async fn close_tree_state(conn: &Connection, tree_arc: &Arc<RwLock<TreeConnect>>) {
     let tree = tree_arc.write().await;
     let opens: Vec<_> = tree.opens.write().await.drain().collect();
     for (_fid, open_arc) in opens {
         let mut open = open_arc.write().await;
+        conn.open_closed(&tree.share, open.lock_owner);
         if let Some(handle) = open.handle.take() {
             let _ = handle.close().await;
         }
@@ -305,7 +407,14 @@ pub struct Open {
     pub is_directory: bool,
     pub delete_on_close: bool,
     pub search_state: Option<DirCursor>,
+    /// Owner of this open's byte-range locks and pending requests; unique
+    /// across the server.
+    pub lock_owner: u64,
+    /// Set by the first CHANGE_NOTIFY on a directory open.
+    pub(crate) watch: Option<Arc<crate::notify::Watch>>,
 }
+
+static NEXT_LOCK_OWNER: AtomicU64 = AtomicU64::new(1);
 
 impl Open {
     pub fn new(
@@ -324,6 +433,8 @@ impl Open {
             is_directory,
             delete_on_close,
             search_state: None,
+            lock_owner: NEXT_LOCK_OWNER.fetch_add(1, Ordering::Relaxed),
+            watch: None,
         }
     }
 }

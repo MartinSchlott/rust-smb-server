@@ -44,7 +44,9 @@ pub async fn handle(
     let path = open.last_path.clone();
     let delete_on_close = open.delete_on_close;
     let want_attrs = req.flags & FLAG_POSTQUERY_ATTRIB != 0;
+    let lock_owner = open.lock_owner;
     drop(open);
+    conn.open_closed(&tree_arc.read().await.share, lock_owner);
 
     if server.trace_sink.is_some() {
         crate::trace::record(

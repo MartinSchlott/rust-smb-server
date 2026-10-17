@@ -47,6 +47,8 @@ pub struct ShareBindings {
     /// (Windows always probes IPC$ before mounting an actual share). All
     /// downstream ops on an IPC$ tree return `STATUS_NOT_SUPPORTED`.
     pub is_ipc: bool,
+    /// Byte-range locks on this share's files.
+    pub(crate) locks: crate::lock::LockTable,
 }
 
 impl ShareBindings {
@@ -62,6 +64,7 @@ impl ShareBindings {
             backend,
             acl: RwLock::new(ShareAcl { mode, users }),
             is_ipc,
+            locks: Default::default(),
         })
     }
 
