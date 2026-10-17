@@ -39,6 +39,10 @@ pub struct HandlerResponse {
     /// SESSION_SETUP on the round that produces STATUS_SUCCESS, so the
     /// session's KDF context can use the snapshot.
     pub take_preauth_snapshot_for_session: Option<u64>,
+    /// No response from the dispatcher: the handler sent its own interim
+    /// `STATUS_PENDING` and owes the final response (async CHANGE_NOTIFY and
+    /// LOCK).
+    pub suppress: bool,
 }
 
 impl HandlerResponse {
@@ -50,6 +54,15 @@ impl HandlerResponse {
             override_session_id: None,
             skip_signing: false,
             take_preauth_snapshot_for_session: None,
+            suppress: false,
+        }
+    }
+
+    /// The handler answered `STATUS_PENDING` itself (see `send_interim`).
+    pub fn pending() -> Self {
+        Self {
+            suppress: true,
+            ..Self::ok(Vec::new())
         }
     }
 
@@ -64,6 +77,7 @@ impl HandlerResponse {
             override_session_id: None,
             skip_signing: false,
             take_preauth_snapshot_for_session: None,
+            suppress: false,
         }
     }
 }
@@ -457,9 +471,10 @@ async fn dispatch_one(
             return Some(bytes);
         }
 
-        // CANCEL is fire-and-forget — no response.
+        // CANCEL is fire-and-forget — no response of its own.
         if cmd == Command::Cancel {
             debug!("CANCEL received; no response");
+            conn.cancel(req_hdr.async_id(), mid);
             return None;
         }
 
@@ -507,6 +522,9 @@ async fn dispatch_one(
             }
         }
 
+        if resp.suppress {
+            return None;
+        }
         let bytes = build_response_bytes(conn, &req_hdr, resp).await;
         crate::trace::record(
             &server.trace_sink,
@@ -633,12 +651,44 @@ async fn verify_request_signature(
     Ok(())
 }
 
+/// Send the interim `STATUS_PENDING` response for `req_hdr` (MS-SMB2
+/// §3.3.4.2). It grants the request's credits; the final response, sent with
+/// [`send_final`], grants none.
+pub(crate) async fn send_interim(conn: &Arc<Connection>, req_hdr: &Smb2Header, async_id: u64) {
+    let resp = HandlerResponse::err(ntstatus::STATUS_PENDING);
+    let bytes = build_response(conn, req_hdr, resp, Some(async_id)).await;
+    conn.send(bytes).await;
+}
+
+/// Send the final response of a request answered with [`send_interim`].
+pub(crate) async fn send_final(
+    conn: &Arc<Connection>,
+    req_hdr: &Smb2Header,
+    async_id: u64,
+    resp: HandlerResponse,
+) {
+    let mut hdr = *req_hdr;
+    hdr.credit_request_response = 0;
+    let bytes = build_response(conn, &hdr, resp, Some(async_id)).await;
+    conn.send(bytes).await;
+}
+
 /// Build the final on-the-wire bytes: header + body, with signing applied
 /// when the session has a key.
 async fn build_response_bytes(
     conn: &Arc<Connection>,
     req_hdr: &Smb2Header,
     handler_resp: HandlerResponse,
+) -> Vec<u8> {
+    build_response(conn, req_hdr, handler_resp, None).await
+}
+
+/// As `build_response_bytes`, in the async header form when `async_id` is set.
+async fn build_response(
+    conn: &Arc<Connection>,
+    req_hdr: &Smb2Header,
+    handler_resp: HandlerResponse,
+    async_id: Option<u64>,
 ) -> Vec<u8> {
     let mut hdr = *req_hdr;
     hdr.flags |= SMB2_FLAGS_SERVER_TO_REDIR;
@@ -650,6 +700,10 @@ async fn build_response_bytes(
             .override_tree_id
             .unwrap_or_else(|| req_hdr.tree_id().unwrap_or(0)),
     );
+    if let Some(id) = async_id {
+        hdr.flags |= SMB2_FLAGS_ASYNC_COMMAND;
+        hdr.tail = HeaderTail::async_(id);
+    }
     if let Some(sid) = handler_resp.override_session_id {
         hdr.session_id = sid;
     }

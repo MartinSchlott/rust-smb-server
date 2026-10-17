@@ -48,13 +48,20 @@ pub async fn handle(
         || req.flags & QueryDirectoryRequest::FLAG_REOPEN != 0;
     let single_entry = req.flags & QueryDirectoryRequest::FLAG_RETURN_SINGLE_ENTRY != 0;
 
+    // An exact-name single-entry probe (macOS checks for AppleDouble and
+    // other names on the folder it watches) lists into a cursor of its own,
+    // so it does not replace the open's match-all listing that macOS goes on
+    // reading after a CHANGE_NOTIFY.
+    let probe = single_entry && pattern.is_some();
+    let mut probe_cursor = None;
+
     // Populate or refresh the cursor.
     {
         let mut open = open_arc.write().await;
         if !open.is_directory {
             return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
         }
-        if open.search_state.is_none() || restart {
+        if open.search_state.is_none() || restart || probe {
             // A backend may claim the filter for this pattern
             // (`Handle::applies_pattern`): its `list_dir(Some(pattern))`
             // result already satisfies `pattern` under its own matching, so
@@ -78,11 +85,16 @@ pub async fn handle(
             if !backend_prefiltered && let Some(pattern) = pattern.as_deref() {
                 entries.retain(|entry| dos_pattern_matches(pattern, &entry.info.name));
             }
-            open.search_state = Some(DirCursor {
+            let cursor = Some(DirCursor {
                 entries,
                 next: 0,
                 pattern: pattern.clone(),
             });
+            if probe {
+                probe_cursor = cursor;
+            } else {
+                open.search_state = cursor;
+            }
         }
     }
 
@@ -93,7 +105,10 @@ pub async fn handle(
 
     {
         let mut open = open_arc.write().await;
-        let cursor = open.search_state.as_mut().expect("populated above");
+        let cursor = match probe_cursor.as_mut() {
+            Some(c) => c,
+            None => open.search_state.as_mut().expect("populated above"),
+        };
         loop {
             if cursor.next >= cursor.entries.len() {
                 break;

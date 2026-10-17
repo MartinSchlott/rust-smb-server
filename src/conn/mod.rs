@@ -29,10 +29,12 @@ pub async fn connection_loop(stream: TcpStream, server: Arc<ServerState>) -> io:
     let (tx, rx) = mpsc::channel::<writer::FramePayload>(writer::WRITER_CHANNEL);
 
     let writer_handle = tokio::spawn(writer::writer_task(write_half, rx));
+    *conn.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
 
     info!("connection accepted");
     let reader_result = reader::reader_task(read_half, server.clone(), conn.clone(), tx).await;
     debug!(?reader_result, "reader exited");
+    conn.teardown().await;
     // Wait for writer to drain.
     let _ = writer_handle.await;
     server.active_connections.unregister(conn_id).await;
