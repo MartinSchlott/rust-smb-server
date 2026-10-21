@@ -981,7 +981,9 @@ mod tests {
         use super::*;
         use crate::conn::writer::{WRITER_CHANNEL, writer_task};
         use crate::incident::{Incident, IncidentKind, IncidentSink};
-        use crate::ntstatus::{STATUS_INTERNAL_ERROR, STATUS_IO_TIMEOUT, STATUS_SUCCESS};
+        use crate::ntstatus::{
+            STATUS_INSUFFICIENT_RESOURCES, STATUS_INTERNAL_ERROR, STATUS_IO_TIMEOUT, STATUS_SUCCESS,
+        };
         use crate::proto::crypto::{SigningAlgo, sign, verify};
         use crate::proto::header::{
             SMB2_FLAGS_RELATED_OPERATIONS, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN,
@@ -1030,6 +1032,9 @@ mod tests {
         }
         fn is_malformed(kind: &IncidentKind) -> bool {
             matches!(kind, IncidentKind::MalformedFrame { .. })
+        }
+        fn is_unavailable(kind: &IncidentKind) -> bool {
+            matches!(kind, IncidentKind::SupervisionUnavailable { .. })
         }
         fn is_closed(kind: &IncidentKind) -> bool {
             matches!(kind, IncidentKind::ConnectionClosed { .. })
@@ -1950,6 +1955,54 @@ mod tests {
                 1,
                 "a MalformedFrame incident for the framing error"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_failed_pulse_start_refuses_that_request_and_keeps_the_connection() {
+            let (state, incidents) = supervised_server(DEADLINE, SLOW, GRACE);
+            // The first start fails; the retry on the next request succeeds.
+            state.pulse.inject_start_failures(1);
+            let server = Arc::new(state);
+            let (conn, session_id, tree_id, _files) = seeded_connection(&server, vec![]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            let first = header(Command::Echo, 11, session_id, tree_id);
+            wire.send(&echo_payload(&first)).await;
+            let response = wire
+                .recv(Duration::from_secs(3))
+                .await
+                .frame("the refused request must still be answered");
+            assert_eq!(header_command(&response), Command::Echo as u16);
+            assert_eq!(status_of(&response), STATUS_INSUFFICIENT_RESOURCES);
+
+            let second = header(Command::Echo, 12, session_id, tree_id);
+            wire.send(&echo_payload(&second)).await;
+            let response = wire
+                .recv(Duration::from_secs(3))
+                .await
+                .frame("the connection must stay usable and retry the start");
+            assert_eq!(status_of(&response), STATUS_SUCCESS);
+
+            let unavailable = incidents.of_kind(is_unavailable);
+            assert_eq!(
+                unavailable.len(),
+                1,
+                "one incident for the one failed start"
+            );
+            assert!(matches!(
+                &unavailable[0].kind,
+                IncidentKind::SupervisionUnavailable { reason }
+                    if reason.contains("injected pulse start failure")
+            ));
+            assert_eq!(unavailable[0].command, Some("Echo"));
+            assert_eq!(unavailable[0].message_id, Some(11));
+            assert_eq!(unavailable[0].compound_ordinal, Some(0));
+            assert!(
+                incidents.of_kind(is_closed).is_empty(),
+                "the connection was not closed"
+            );
+            wire.assert_barrier_answered(13, (session_id, tree_id))
+                .await;
         }
 
         // ── load and barrier frames ──────────────────────────────────────

@@ -30,6 +30,12 @@ pub enum IncidentKind {
     /// A frame's framing or compound chain is malformed; the connection is
     /// closed and nothing in the frame was executed.
     MalformedFrame { reason: String },
+    /// The server could not supervise the request — the runtime pulse thread
+    /// that keeps the supervisor's timers alive could not be started — so it
+    /// refused exactly this request with `STATUS_INSUFFICIENT_RESOURCES`
+    /// without running its handler. The connection stays open and the next
+    /// request retries the start. Terminal for the request's identity.
+    SupervisionUnavailable { reason: String },
     /// The server closed the connection: a handler could not be cancelled
     /// within the grace period, or the server's own glue panicked.
     ConnectionClosed { reason: String },

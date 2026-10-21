@@ -264,6 +264,9 @@ enum Supervised {
     /// The handler could not be stopped; the connection is closed and this
     /// frame sends nothing more.
     Abandoned,
+    /// The request could not be supervised and was not run; it is answered
+    /// `STATUS_INSUFFICIENT_RESOURCES`.
+    Refused,
 }
 
 /// Top-level frame dispatch.
@@ -404,6 +407,12 @@ pub async fn dispatch_frame(
                     ))
                 }
                 Supervised::Abandoned => return FrameOutcome::NoResponse,
+                Supervised::Refused => Some(error_response(
+                    server,
+                    conn,
+                    &sub,
+                    ntstatus::STATUS_INSUFFICIENT_RESOURCES,
+                )),
             },
         };
 
@@ -472,22 +481,23 @@ async fn run_supervised(
         Ok(in_flight) => in_flight,
         Err(e) => {
             // Without the pulse a synchronously blocking handler could stall
-            // every timer, including this supervisor's own. Not running the
-            // handler unsupervised is the only choice that keeps the contract;
-            // closing the connection reports it through the incident channel.
+            // every timer, including this supervisor's own, so the handler is
+            // not run unsupervised. The request can still be answered, so
+            // exactly this request is refused and the connection stays open;
+            // the next request retries starting the pulse.
+            let path = sub.path_hint(conn);
             crate::supervise::emit(
                 server,
                 conn,
                 sub.incident(
                     conn,
-                    IncidentKind::ConnectionClosed {
+                    IncidentKind::SupervisionUnavailable {
                         reason: format!("the runtime pulse thread could not be started: {e}"),
                     },
-                    None,
+                    path,
                 ),
             );
-            conn.close();
-            return Supervised::Abandoned;
+            return Supervised::Refused;
         }
     };
     // Task-local trace correlation is not inherited across `tokio::spawn`.

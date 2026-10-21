@@ -56,6 +56,9 @@ impl Shared {
 /// One per `ServerState`. Dropping it ends the thread, parked or not.
 pub(crate) struct Pulse {
     shared: Arc<Shared>,
+    /// Test seam: how many upcoming thread starts fail.
+    #[cfg(test)]
+    fail_starts: std::sync::atomic::AtomicUsize,
 }
 
 /// Marks one supervised handler as in flight until dropped — on normal
@@ -69,6 +72,8 @@ pub(crate) struct InFlight {
 impl Pulse {
     pub(crate) fn new() -> Self {
         Self {
+            #[cfg(test)]
+            fail_starts: std::sync::atomic::AtomicUsize::new(0),
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
                     in_flight: 0,
@@ -92,6 +97,18 @@ impl Pulse {
     pub(crate) fn enter(&self) -> io::Result<InFlight> {
         let mut state = self.shared.lock();
         if !state.started {
+            #[cfg(test)]
+            if self
+                .fail_starts
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(io::Error::other("injected pulse start failure"));
+            }
             let handle = tokio::runtime::Handle::current();
             let shared = self.shared.clone();
             std::thread::Builder::new()
@@ -106,6 +123,13 @@ impl Pulse {
         Ok(InFlight {
             shared: self.shared.clone(),
         })
+    }
+
+    /// Makes the next `count` thread starts fail.
+    #[cfg(test)]
+    pub(crate) fn inject_start_failures(&self, count: usize) {
+        self.fail_starts
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
