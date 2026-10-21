@@ -1549,6 +1549,15 @@ mod tests {
                 closed_after >= DEADLINE + GRACE - Duration::from_millis(50),
                 "closed before deadline + grace: {closed_after:?}"
             );
+            // Real elapsed time, not the runtime's: the `recv` bound above
+            // runs on the runtime's own timers, which a blocked worker can
+            // stall. The close must land well before the handler's sleep
+            // ends; the slack covers the 100 ms pulse lag and scheduling.
+            assert!(
+                closed_after < DEADLINE + GRACE + Duration::from_millis(500),
+                "closed only after {closed_after:?}, not shortly after deadline + grace \
+                 (the handler sleeps for {block:?})"
+            );
             assert!(
                 !wire.reader.is_finished(),
                 "reader_task must not return while the abandoned handler still runs"
