@@ -462,24 +462,45 @@ async fn run_supervised(
         sid = sub.hdr.session_id,
         tid = sub.hdr.tree_id().unwrap_or(0)
     );
+    // The pulse that keeps the runtime's timers alive while a handler blocks a
+    // worker (see `crate::pulse`) must be counting before the handler can first
+    // be polled, and keep counting for as long as the handler's future exists:
+    // the guard travels into the task, so it is released on completion, on
+    // panic and on cancellation — and, for a synchronous handler that cannot be
+    // cancelled, only when it finally returns.
+    let in_flight = match server.pulse.enter() {
+        Ok(in_flight) => in_flight,
+        Err(e) => {
+            // Without the pulse a synchronously blocking handler could stall
+            // every timer, including this supervisor's own. Not running the
+            // handler unsupervised is the only choice that keeps the contract;
+            // closing the connection reports it through the incident channel.
+            crate::supervise::emit(
+                server,
+                conn,
+                sub.incident(
+                    conn,
+                    IncidentKind::ConnectionClosed {
+                        reason: format!("the runtime pulse thread could not be started: {e}"),
+                    },
+                    None,
+                ),
+            );
+            conn.close();
+            return Supervised::Abandoned;
+        }
+    };
     // Task-local trace correlation is not inherited across `tokio::spawn`.
+    let (task_server, task_conn, task_frames) = (server.clone(), conn.clone(), sub.frames.clone());
+    let (task_hdr, task_failure) = (sub.hdr, sub.inherited_failure);
     let mut task = tokio::spawn(
-        crate::trace::scoped(
-            sub.trace_key,
-            handle_one(
-                server.clone(),
-                conn.clone(),
-                sub.hdr,
-                sub.frames.clone(),
-                sub.inherited_failure,
-            ),
-        )
+        crate::trace::scoped(sub.trace_key, async move {
+            let _in_flight = in_flight;
+            handle_one(task_server, task_conn, task_hdr, task_frames, task_failure).await
+        })
         .instrument(span),
     );
 
-    // Held until this function returns — also while waiting out an abandoned
-    // handler — so the runtime's timers stay alive for as long as one runs.
-    let _in_flight = server.pulse.enter();
     let started = Instant::now();
     let slow_at = started + server.slow_dispatch_threshold;
     let mut slow_reported = false;
