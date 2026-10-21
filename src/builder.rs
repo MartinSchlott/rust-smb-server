@@ -3,12 +3,17 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::backend::ShareBackend;
-use crate::server::{ServerConfig, ServerState, ServerUsers, ShareBindings, ShareMode, SmbServer};
+use crate::incident::IncidentSink;
+use crate::server::{
+    DEFAULT_CANCELLATION_GRACE, DEFAULT_DISPATCH_DEADLINE, DEFAULT_SLOW_DISPATCH_THRESHOLD,
+    ServerConfig, ServerState, ServerUsers, ShareBindings, ShareMode, SmbServer,
+};
 use crate::trace::TraceSink;
 
 // ---------------------------------------------------------------------------
@@ -119,6 +124,10 @@ pub struct SmbServerBuilder {
     max_write_size: u32,
     server_guid: Option<Uuid>,
     trace_sink: Option<Arc<dyn TraceSink>>,
+    incident_sink: Option<Arc<dyn IncidentSink>>,
+    dispatch_deadline: Duration,
+    slow_dispatch_threshold: Duration,
+    cancellation_grace: Duration,
 }
 
 impl Default for SmbServerBuilder {
@@ -139,6 +148,10 @@ impl SmbServerBuilder {
             max_write_size: 1024 * 1024,
             server_guid: None,
             trace_sink: None,
+            incident_sink: None,
+            dispatch_deadline: DEFAULT_DISPATCH_DEADLINE,
+            slow_dispatch_threshold: DEFAULT_SLOW_DISPATCH_THRESHOLD,
+            cancellation_grace: DEFAULT_CANCELLATION_GRACE,
         }
     }
 
@@ -187,6 +200,37 @@ impl SmbServerBuilder {
     /// allocated or formatted — this method is the only way to change that.
     pub fn trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
         self.trace_sink = Some(sink);
+        self
+    }
+
+    /// Receives every dispatch incident: a handler still running after the
+    /// slow threshold, a panic, an expired deadline, a malformed frame, a
+    /// forced connection close. Without a sink, incidents go to `tracing`.
+    /// The sink is called synchronously from the frame task and must not block.
+    pub fn incident_sink(mut self, sink: Arc<dyn IncidentSink>) -> Self {
+        self.incident_sink = Some(sink);
+        self
+    }
+
+    /// Bounds one frame, measured from its admission (default 60 s). A request
+    /// still running at the deadline is cancelled and answered
+    /// `STATUS_IO_TIMEOUT`.
+    pub fn dispatch_deadline(mut self, deadline: Duration) -> Self {
+        self.dispatch_deadline = deadline;
+        self
+    }
+
+    /// A handler running longer than this is reported as an incident
+    /// (default 5 s); a diagnostic only, it changes nothing about the request.
+    pub fn slow_dispatch_threshold(mut self, threshold: Duration) -> Self {
+        self.slow_dispatch_threshold = threshold;
+        self
+    }
+
+    /// How long a cancelled handler may take to stop (default 5 s) before the
+    /// server closes the connection instead of answering.
+    pub fn cancellation_grace(mut self, grace: Duration) -> Self {
+        self.cancellation_grace = grace;
         self
     }
 
@@ -266,6 +310,10 @@ impl SmbServerBuilder {
 
         let mut state = ServerState::new(cfg, users, share_bindings);
         state.trace_sink = self.trace_sink;
+        state.incident_sink = self.incident_sink;
+        state.dispatch_deadline = self.dispatch_deadline;
+        state.slow_dispatch_threshold = self.slow_dispatch_threshold;
+        state.cancellation_grace = self.cancellation_grace;
         Ok(SmbServer::from_state(state))
     }
 }

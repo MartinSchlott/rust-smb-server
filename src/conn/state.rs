@@ -59,6 +59,28 @@ pub struct Connection {
 
     /// Monotonic SessionId allocator.
     next_session_id: AtomicU64,
+
+    /// Idempotent close signal; the writer task selects on it.
+    close: tokio::sync::watch::Sender<bool>,
+
+    /// What response building needs of the connection's signing state, kept
+    /// in a synchronous map so that building a response never awaits a lock a
+    /// handler (or a long runtime-config operation) can hold. Updated at every
+    /// site that changes what it mirrors, while the corresponding tokio write
+    /// guard is held; only ever locked for copies, never across an `.await`.
+    signing: Mutex<SigningContext>,
+}
+
+/// The signing facts of one session, as response building needs them.
+#[derive(Clone, Copy)]
+pub(crate) struct SessionSigning {
+    pub key: [u8; 16],
+    pub anonymous: bool,
+}
+
+struct SigningContext {
+    algo: SigningAlgo,
+    sessions: HashMap<u64, SessionSigning>,
 }
 
 impl Connection {
@@ -81,7 +103,58 @@ impl Connection {
             pending_auths: RwLock::new(HashMap::new()),
             session_preauth: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
+            close: tokio::sync::watch::channel(false).0,
+            signing: Mutex::new(SigningContext {
+                algo: SigningAlgo::HmacSha256,
+                sessions: HashMap::new(),
+            }),
         }
+    }
+
+    /// Asks the writer task to shut the socket down, which sends FIN and
+    /// drops the channel the reader's admission depends on. Idempotent.
+    pub fn close(&self) {
+        self.close.send_replace(true);
+    }
+
+    pub fn subscribe_close(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.close.subscribe()
+    }
+
+    fn signing(&self) -> std::sync::MutexGuard<'_, SigningContext> {
+        self.signing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Mirrors the negotiated signing algorithm; call while holding the
+    /// `signing_algo` write guard.
+    pub(crate) fn set_signing_algo(&self, algo: SigningAlgo) {
+        self.signing().algo = algo;
+    }
+
+    /// Mirrors a session's signing context; call while holding the
+    /// `sessions` write guard (or the session's, for a re-key).
+    pub fn snapshot_session(&self, session_id: u64, signing_key: [u8; 16], anonymous: bool) {
+        self.signing().sessions.insert(
+            session_id,
+            SessionSigning {
+                key: signing_key,
+                anonymous,
+            },
+        );
+    }
+
+    /// Forgets a removed session; call while holding the `sessions` write guard.
+    pub(crate) fn forget_session(&self, session_id: u64) {
+        self.signing().sessions.remove(&session_id);
+    }
+
+    /// The signing algorithm and, for a known session, its signing facts. A
+    /// session absent from the snapshot is not signed for.
+    pub(crate) fn signing_context(&self, session_id: u64) -> (SigningAlgo, Option<SessionSigning>) {
+        let signing = self.signing();
+        (signing.algo, signing.sessions.get(&session_id).copied())
     }
 
     pub fn alloc_session_id(&self) -> u64 {
@@ -91,7 +164,9 @@ impl Connection {
     pub async fn close_session(&self, session_id: u64) -> bool {
         let removed = {
             let mut sessions = self.sessions.write().await;
-            sessions.remove(&session_id)
+            let removed = sessions.remove(&session_id);
+            self.forget_session(session_id);
+            removed
         };
         if let Some(sess_arc) = removed {
             close_session_state(&sess_arc).await;

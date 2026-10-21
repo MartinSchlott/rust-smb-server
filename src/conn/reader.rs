@@ -11,7 +11,29 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error};
 
 use crate::conn::state::Connection;
+use crate::conn::writer::FramePayload;
+use crate::dispatch::FrameOutcome;
 use crate::server::ServerState;
+use crate::supervise::{catch_future_unwind, report_glue_panic, report_malformed};
+
+/// The 4-byte length header of a frame could not be decoded. Carried inside
+/// the `io::Error` `read_one_frame` returns, so the reader can tell a framing
+/// error (a peer speaking garbage, reported as an incident) from a plain I/O
+/// error (a connection that ended, which is not).
+#[derive(Debug)]
+struct FramingError(String);
+
+impl std::fmt::Display for FramingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FramingError {}
+
+fn is_framing_error(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<FramingError>())
+}
 
 /// Read one frame's payload (without the 4-byte length prefix).
 ///
@@ -27,7 +49,10 @@ pub async fn read_one_frame(reader: &mut ReadHalf<TcpStream>) -> io::Result<Opti
     let len = match decode_frame_header(&hdr) {
         Ok(n) => n,
         Err(e) => {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                FramingError(e.to_string()),
+            ));
         }
     };
     let mut payload = vec![0u8; len as usize];
@@ -40,24 +65,83 @@ pub async fn read_one_frame(reader: &mut ReadHalf<TcpStream>) -> io::Result<Opti
 /// above the concurrency a loopback server over local-SSD I/O can use.
 const MAX_INFLIGHT: usize = 64;
 
+/// Whether the reader goes on after a frame.
+enum FrameResult {
+    Continue,
+    /// The connection is over for admission purposes: the writer channel is
+    /// closed, or the frame was malformed and the connection closed.
+    Stop,
+}
+
+/// Runs one admitted frame to its answer, under a panic wrapper, and sends
+/// the response. The dispatcher supervises every handler inside the frame;
+/// this wrapper covers the server's own glue around them (validation,
+/// response building, stitching), so the reader task never unwinds from a
+/// frame. A panic there closes the connection: a request may be left without
+/// an answer, and the only safe way to keep the contract is to end the
+/// connection.
+///
+/// Sending the response stays outside the dispatcher's deadline: it blocks
+/// only when the client stops reading, which is transport backpressure, not a
+/// stuck request.
+async fn run_frame(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    tx: &tokio::sync::mpsc::Sender<FramePayload>,
+    frame: &[u8],
+) -> FrameResult {
+    match catch_future_unwind(crate::dispatch::dispatch_frame(server, conn, frame)).await {
+        Ok(FrameOutcome::Response(bytes)) => {
+            if tx.send(bytes).await.is_err() {
+                debug!("writer channel closed; reader exiting");
+                return FrameResult::Stop;
+            }
+            FrameResult::Continue
+        }
+        Ok(FrameOutcome::NoResponse) => FrameResult::Continue,
+        Ok(FrameOutcome::Malformed { reason }) => {
+            report_malformed(server, conn, reason);
+            FrameResult::Stop
+        }
+        Err(payload) => {
+            report_glue_panic(server, conn, &*payload);
+            FrameResult::Stop
+        }
+    }
+}
+
 /// Continuously read frames and dispatch them.
+///
+/// Every admitted frame is answered, or the connection is closed — the reader
+/// never leaves an open connection silent on a request (CANCEL, which the
+/// protocol leaves unanswered, excepted). `dispatch_frame` bounds each frame
+/// by a deadline from its admission, answers a panicking or expired handler
+/// with an error status, and closes the connection when a handler cannot be
+/// stopped; `run_frame` closes it when the server's own glue panics. A frame
+/// whose framing or compound chain is malformed closes the connection too.
 ///
 /// Data-path frames are dispatched concurrently, up to `MAX_INFLIGHT` at
 /// once (PLAN_PERF1): each gets its own spawned task holding one permit from
 /// `inflight`, so the reader can read and admit the next frame without
 /// waiting for the previous one's response. A frame classified by
 /// `dispatch::frame_must_be_serialized` (NEGOTIATE, SESSION_SETUP, LOGOFF,
-/// TREE_CONNECT, TREE_DISCONNECT, anywhere in its compound chain) is instead
-/// a hard barrier: the reader waits for every currently in-flight dispatch to
-/// finish, then runs it inline, before admitting anything else. This keeps
-/// connection- and session-setup frames from racing in-flight data
-/// operations while still letting ordinary READ/WRITE/QUERY_INFO/etc. frames
-/// overlap.
+/// TREE_CONNECT, TREE_DISCONNECT, anywhere in its compound chain, or a frame
+/// that does not validate) is instead a hard barrier: the reader waits for
+/// every currently in-flight dispatch to finish, then runs it inline, before
+/// admitting anything else. This keeps connection- and session-setup frames
+/// from racing in-flight data operations while still letting ordinary
+/// READ/WRITE/QUERY_INFO/etc. frames overlap. Because every dispatch ends
+/// within its deadline (or the connection closes), the barrier wait is
+/// bounded.
+///
+/// `reader_task` returns only after every dispatch it spawned has ended, so
+/// no handler touches connection state afterwards — including a handler that
+/// was abandoned and could not be cancelled.
 pub async fn reader_task(
     mut reader: ReadHalf<TcpStream>,
     server: Arc<ServerState>,
     conn: Arc<Connection>,
-    tx: tokio::sync::mpsc::Sender<crate::conn::writer::FramePayload>,
+    tx: tokio::sync::mpsc::Sender<FramePayload>,
 ) -> io::Result<()> {
     let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
 
@@ -83,6 +167,9 @@ pub async fn reader_task(
                     }
                     Err(e) => {
                         error!(error = %e, "frame read error");
+                        if is_framing_error(&e) {
+                            report_malformed(&server, &conn, e.to_string());
+                        }
                         break Err(e);
                     }
                 }
@@ -117,11 +204,7 @@ pub async fn reader_task(
                     permits.expect("inflight semaphore is never closed")
                 }
             };
-            let response = crate::dispatch::dispatch_frame(&server, &conn, &frame).await;
-            if let Some(bytes) = response
-                && tx.send(bytes).await.is_err()
-            {
-                debug!("writer channel closed; reader exiting");
+            if let FrameResult::Stop = run_frame(&server, &conn, &tx, &frame).await {
                 break Ok(());
             }
         } else {
@@ -145,10 +228,10 @@ pub async fn reader_task(
             let tx = tx.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let response = crate::dispatch::dispatch_frame(&server, &conn, &frame).await;
-                if let Some(bytes) = response {
-                    let _ = tx.send(bytes).await;
-                }
+                // A `Stop` needs no action here: the writer channel is
+                // already closed, or `conn.close()` has made the writer exit,
+                // and either one stops the reader's admission.
+                let _ = run_frame(&server, &conn, &tx, &frame).await;
             });
         }
     };
@@ -883,5 +966,1091 @@ mod tests {
                 .contains_key(&tree_id),
             "TREE_DISCONNECT must not have torn down the tree it never entered"
         );
+    }
+
+    // ── Dispatch supervision: every admitted request is answered, or the
+    // connection is closed ────────────────────────────────────────────────
+    //
+    // These tests drive the real `reader_task` and the real `writer_task`
+    // over a loopback socket, so a test sees exactly what a client sees:
+    // responses, silence, or EOF. Every wait is bounded, so a missing
+    // response fails the test instead of hanging it. They need worker threads
+    // beyond the test's own: the supervisor's timers must keep running while a
+    // non-yielding handler occupies one.
+    mod supervision {
+        use super::*;
+        use crate::conn::writer::{WRITER_CHANNEL, writer_task};
+        use crate::incident::{Incident, IncidentKind, IncidentSink};
+        use crate::ntstatus::{STATUS_INTERNAL_ERROR, STATUS_IO_TIMEOUT, STATUS_SUCCESS};
+        use crate::proto::crypto::{SigningAlgo, sign, verify};
+        use crate::proto::header::{
+            SMB2_FLAGS_RELATED_OPERATIONS, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN,
+        };
+        use crate::tests::handler_support::{close_request, create_request};
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncReadExt;
+
+        // Short durations: deadline 500 ms, slow threshold 100 ms, grace 200 ms.
+        const DEADLINE: Duration = Duration::from_millis(500);
+        const SLOW: Duration = Duration::from_millis(100);
+        const GRACE: Duration = Duration::from_millis(200);
+
+        const SIGNING_KEY: [u8; 16] = [7; 16];
+
+        // ── incident capture ─────────────────────────────────────────────
+
+        #[derive(Default)]
+        struct RecordedIncidents(StdMutex<Vec<Incident>>);
+
+        impl IncidentSink for RecordedIncidents {
+            fn record(&self, incident: &Incident) {
+                self.0.lock().unwrap().push(incident.clone());
+            }
+        }
+
+        impl RecordedIncidents {
+            fn all(&self) -> Vec<Incident> {
+                self.0.lock().unwrap().clone()
+            }
+
+            fn of_kind(&self, pick: impl Fn(&IncidentKind) -> bool) -> Vec<Incident> {
+                self.all().into_iter().filter(|i| pick(&i.kind)).collect()
+            }
+        }
+
+        fn is_slow(kind: &IncidentKind) -> bool {
+            matches!(kind, IncidentKind::Slow)
+        }
+        fn is_timed_out(kind: &IncidentKind) -> bool {
+            matches!(kind, IncidentKind::TimedOut)
+        }
+        fn is_panicked(kind: &IncidentKind) -> bool {
+            matches!(kind, IncidentKind::Panicked { .. })
+        }
+        fn is_malformed(kind: &IncidentKind) -> bool {
+            matches!(kind, IncidentKind::MalformedFrame { .. })
+        }
+        fn is_closed(kind: &IncidentKind) -> bool {
+            matches!(kind, IncidentKind::ConnectionClosed { .. })
+        }
+
+        /// The identity of a sub-request: the fields of the fork's `TraceKey`.
+        fn identity(incident: &Incident) -> (u64, Option<u64>, Option<u32>) {
+            (
+                incident.connection_id,
+                incident.message_id,
+                incident.compound_ordinal,
+            )
+        }
+
+        /// Records, at the moment a TREE_DISCONNECT enters dispatch, whether a
+        /// flag is already set — proof that something finished *before* the
+        /// serialization barrier let the TREE_DISCONNECT run.
+        struct FlagAtTreeDisconnect {
+            flag: Arc<AtomicBool>,
+            seen: StdMutex<Option<bool>>,
+        }
+
+        impl TraceSink for FlagAtTreeDisconnect {
+            fn record(&self, _key: Option<TraceKey>, event: &TraceEvent) {
+                if let TraceEvent::Request { cmd, .. } = event
+                    && *cmd == "TreeDisconnect"
+                {
+                    *self.seen.lock().unwrap() = Some(self.flag.load(Ordering::SeqCst));
+                }
+            }
+        }
+
+        fn supervised_server(
+            deadline: Duration,
+            slow: Duration,
+            grace: Duration,
+        ) -> (ServerState, Arc<RecordedIncidents>) {
+            let incidents = Arc::new(RecordedIncidents::default());
+            let mut state = ServerState::new(
+                ServerConfig {
+                    listen_addr: "127.0.0.1:0".parse().unwrap(),
+                    netbios_name: "TEST".to_owned(),
+                    max_read_size: 1 << 20,
+                    max_write_size: 1 << 20,
+                    server_guid: Uuid::nil(),
+                },
+                ServerUsers {
+                    table: RwLock::new(HashMap::new()),
+                },
+                vec![],
+            );
+            state.incident_sink = Some(incidents.clone());
+            state.dispatch_deadline = deadline;
+            state.slow_dispatch_threshold = slow;
+            state.cancellation_grace = grace;
+            (state, incidents)
+        }
+
+        fn short_server() -> (Arc<ServerState>, Arc<RecordedIncidents>) {
+            let (state, incidents) = supervised_server(DEADLINE, SLOW, GRACE);
+            (Arc::new(state), incidents)
+        }
+
+        // ── handles whose `read` misbehaves ──────────────────────────────
+
+        enum Fault {
+            /// `read` panics.
+            Panic,
+            /// `read` never completes; its future holds a guard that sets the
+            /// flag when dropped, so a test can see that cancellation finished.
+            Never { dropped: Arc<AtomicBool> },
+            /// `read` blocks the worker thread without yielding.
+            SyncBlock(Duration),
+            /// `close` panics, which a TREE_DISCONNECT (a serialized frame)
+            /// reaches through the tree teardown.
+            PanicOnClose,
+        }
+
+        struct FaultHandle {
+            fault: Fault,
+            entered: mpsc::UnboundedSender<()>,
+        }
+
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        #[async_trait]
+        impl Handle for FaultHandle {
+            async fn read(&self, _offset: u64, _len: u32) -> SmbResult<Bytes> {
+                let _ = self.entered.send(());
+                match &self.fault {
+                    Fault::Panic => panic!("handler exploded"),
+                    Fault::Never { dropped } => {
+                        let _guard = DropFlag(dropped.clone());
+                        std::future::pending::<()>().await;
+                        unreachable!("a pending future never resolves")
+                    }
+                    Fault::SyncBlock(duration) => {
+                        std::thread::sleep(*duration);
+                        Ok(Bytes::from_static(b"0123456789abcdef"))
+                    }
+                    Fault::PanicOnClose => Ok(Bytes::from_static(b"0123456789abcdef")),
+                }
+            }
+            async fn write(&self, _offset: u64, data: &[u8]) -> SmbResult<u32> {
+                Ok(data.len() as u32)
+            }
+            async fn flush(&self) -> SmbResult<()> {
+                Ok(())
+            }
+            async fn stat(&self) -> SmbResult<FileInfo> {
+                Ok(FileInfo {
+                    name: "block".to_owned(),
+                    end_of_file: 16,
+                    allocation_size: 16,
+                    creation_time: 0,
+                    last_access_time: 0,
+                    last_write_time: 0,
+                    change_time: 0,
+                    is_directory: false,
+                    is_symlink: false,
+                    file_index: 0,
+                })
+            }
+            async fn set_times(&self, _times: FileTimes) -> SmbResult<()> {
+                Ok(())
+            }
+            async fn truncate(&self, _len: u64) -> SmbResult<()> {
+                Ok(())
+            }
+            async fn list_dir(&self, _pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
+                Ok(vec![])
+            }
+            async fn close(self: Box<Self>) -> SmbResult<()> {
+                if matches!(self.fault, Fault::PanicOnClose) {
+                    panic!("close exploded");
+                }
+                Ok(())
+            }
+        }
+
+        fn fault_handle(fault: Fault) -> (Box<dyn Handle>, mpsc::UnboundedReceiver<()>) {
+            let (entered, entered_rx) = mpsc::unbounded_channel();
+            (Box::new(FaultHandle { fault, entered }), entered_rx)
+        }
+
+        fn never_fault() -> (Fault, Arc<AtomicBool>) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            (
+                Fault::Never {
+                    dropped: dropped.clone(),
+                },
+                dropped,
+            )
+        }
+
+        /// A share backend whose every `open` yields a handle built by `make`,
+        /// so a CREATE on the wire reaches a handle of the test's choosing.
+        struct HandleBackend {
+            make: Box<dyn Fn() -> Box<dyn Handle> + Send + Sync>,
+        }
+
+        #[async_trait]
+        impl crate::backend::ShareBackend for HandleBackend {
+            async fn open(
+                &self,
+                _path: &crate::path::SmbPath,
+                _opts: crate::backend::OpenOptions,
+            ) -> SmbResult<Box<dyn Handle>> {
+                Ok((self.make)())
+            }
+            async fn unlink(&self, _path: &crate::path::SmbPath) -> SmbResult<()> {
+                Err(crate::error::SmbError::NotSupported)
+            }
+            async fn rename(
+                &self,
+                _from: &crate::path::SmbPath,
+                _to: &crate::path::SmbPath,
+                _replace: bool,
+            ) -> SmbResult<()> {
+                Err(crate::error::SmbError::NotSupported)
+            }
+            fn capabilities(&self) -> crate::backend::BackendCapabilities {
+                crate::backend::BackendCapabilities::default()
+            }
+        }
+
+        /// A session of an authenticated user holding `SIGNING_KEY`, one tree
+        /// over `backend`, and no opens: a signed session that a CREATE on the
+        /// wire populates.
+        async fn signed_connection_over(backend: HandleBackend) -> (Arc<Connection>, u64, u32) {
+            let conn = Arc::new(Connection::new(1, Uuid::nil(), 1 << 20, 1 << 20));
+            let session_id = conn.alloc_session_id();
+            let session = Session::new(
+                session_id,
+                Identity::User {
+                    user: "tester".to_owned(),
+                    domain: String::new(),
+                },
+                [0; 16],
+                SIGNING_KEY,
+                false,
+                None,
+            );
+            let tree_id = session.alloc_tree_id();
+            let share = ShareBindings::new(
+                "test".to_owned(),
+                Arc::new(backend),
+                ShareMode::Public,
+                HashMap::new(),
+                false,
+            );
+            let tree = TreeConnect::new(tree_id, share, Access::ReadWrite);
+            session
+                .trees
+                .write()
+                .await
+                .insert(tree_id, Arc::new(RwLock::new(tree)));
+            conn.sessions
+                .write()
+                .await
+                .insert(session_id, Arc::new(RwLock::new(session)));
+            conn.snapshot_session(session_id, SIGNING_KEY, false);
+            (conn, session_id, tree_id)
+        }
+
+        // ── the wire ─────────────────────────────────────────────────────
+
+        struct Wire {
+            client: TcpStream,
+            reader: tokio::task::JoinHandle<io::Result<()>>,
+        }
+
+        enum Recv {
+            Frame(Vec<u8>),
+            Eof,
+            Silent,
+        }
+
+        impl Recv {
+            fn frame(self, what: &str) -> Vec<u8> {
+                match self {
+                    Recv::Frame(frame) => frame,
+                    Recv::Eof => panic!("{what}: the connection closed instead"),
+                    Recv::Silent => panic!("{what}: no response arrived in time"),
+                }
+            }
+        }
+
+        /// Runs the connection the way `connection_loop` does — a real writer
+        /// task plus `reader_task` — over a loopback socket.
+        async fn spawn_wire(server: Arc<ServerState>, conn: Arc<Connection>) -> Wire {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (accepted, connected) = tokio::join!(listener.accept(), TcpStream::connect(addr));
+            let server_side = accepted.expect("accept").0;
+            let client = connected.expect("connect");
+            let (read_half, write_half) = tokio::io::split(server_side);
+            let (tx, rx) = mpsc::channel(WRITER_CHANNEL);
+            tokio::spawn(writer_task(write_half, rx, conn.subscribe_close()));
+            let reader = tokio::spawn(reader_task(read_half, server, conn, tx));
+            Wire { client, reader }
+        }
+
+        impl Wire {
+            async fn send(&mut self, payload: &[u8]) {
+                write_frame(&mut self.client, payload).await;
+            }
+
+            async fn send_raw(&mut self, bytes: &[u8]) {
+                self.client.write_all(bytes).await.expect("write raw bytes");
+            }
+
+            async fn recv(&mut self, within: Duration) -> Recv {
+                let read = async {
+                    let mut hdr = [0u8; FRAME_HEADER_LEN];
+                    self.client.read_exact(&mut hdr).await?;
+                    let len = decode_frame_header(&hdr)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    let mut payload = vec![0u8; len as usize];
+                    self.client.read_exact(&mut payload).await?;
+                    io::Result::Ok(payload)
+                };
+                match tokio::time::timeout(within, read).await {
+                    Err(_) => Recv::Silent,
+                    Ok(Ok(frame)) => Recv::Frame(frame),
+                    Ok(Err(_)) => Recv::Eof,
+                }
+            }
+
+            /// A TREE_DISCONNECT is a barrier frame: it is answered, with any
+            /// status, only if the connection is alive and unstalled.
+            async fn assert_barrier_answered(&mut self, message_id: u64, ids: (u64, u32)) {
+                let hdr = header(Command::TreeDisconnect, message_id, ids.0, ids.1);
+                self.send(&tree_disconnect_payload(&hdr)).await;
+                let response = self
+                    .recv(Duration::from_secs(5))
+                    .await
+                    .frame("the barrier frame after the fault");
+                assert_eq!(header_command(&response), Command::TreeDisconnect as u16);
+            }
+        }
+
+        // ── frame builders ───────────────────────────────────────────────
+
+        fn body_of(payload: &[u8]) -> Vec<u8> {
+            payload[SMB2_HEADER_LEN..].to_vec()
+        }
+
+        fn read_body(file_id: FileId) -> Vec<u8> {
+            let hdr = header(Command::Read, 0, 0, 0);
+            body_of(&read_request_payload(&hdr, file_id))
+        }
+
+        fn echo_body() -> Vec<u8> {
+            body_of(&echo_payload(&header(Command::Echo, 0, 0, 0)))
+        }
+
+        fn align8(n: usize) -> usize {
+            (n + 7) & !7
+        }
+
+        /// Builds a compound frame from `(header, body)` parts. Every part but
+        /// the first is marked related; every part is padded to 8 bytes (except
+        /// the last) and, with `key`, signed over its own padded bytes, exactly
+        /// as a client signs the wire form (sentinel ids included).
+        fn compound(parts: Vec<(Smb2Header, Vec<u8>)>, key: Option<[u8; 16]>) -> Vec<u8> {
+            let count = parts.len();
+            let mut out = Vec::new();
+            for (index, (mut hdr, body)) in parts.into_iter().enumerate() {
+                let last = index + 1 == count;
+                let padded = if last {
+                    SMB2_HEADER_LEN + body.len()
+                } else {
+                    align8(SMB2_HEADER_LEN + body.len())
+                };
+                hdr.next_command = if last { 0 } else { padded as u32 };
+                if index > 0 {
+                    hdr.flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+                }
+                if key.is_some() {
+                    hdr.flags |= SMB2_FLAGS_SIGNED;
+                }
+                let mut part = frame_payload(&hdr, &body);
+                part.resize(padded, 0);
+                if let Some(key) = key {
+                    sign(&mut part, &key, SigningAlgo::HmacSha256).expect("sign request");
+                }
+                out.extend_from_slice(&part);
+            }
+            out
+        }
+
+        fn sentinel_header(command: Command, message_id: u64) -> Smb2Header {
+            header(command, message_id, u64::MAX, u32::MAX)
+        }
+
+        /// The entries of a (possibly compound) response, each trimmed of its
+        /// alignment padding where the chain says so.
+        fn response_entries(frame: &[u8]) -> Vec<Vec<u8>> {
+            let mut entries = Vec::new();
+            let mut offset = 0;
+            loop {
+                let next = read_u32(frame, offset + 0x14) as usize;
+                if next == 0 {
+                    entries.push(frame[offset..].to_vec());
+                    return entries;
+                }
+                entries.push(frame[offset..offset + next].to_vec());
+                offset += next;
+            }
+        }
+
+        fn status_of(entry: &[u8]) -> u32 {
+            read_u32(entry, 0x08)
+        }
+
+        fn session_id_of(entry: &[u8]) -> u64 {
+            u64::from_le_bytes(entry[0x28..0x30].try_into().unwrap())
+        }
+
+        fn tree_id_of(entry: &[u8]) -> u32 {
+            read_u32(entry, 0x24)
+        }
+
+        /// Whether the entry carries a valid signature. The padding after the
+        /// signed bytes is unknown to the caller, so each possible length is
+        /// tried.
+        fn signature_valid(entry: &[u8]) -> bool {
+            if read_u32(entry, 0x10) & SMB2_FLAGS_SIGNED == 0 {
+                return false;
+            }
+            (entry.len().saturating_sub(7)..=entry.len())
+                .filter(|len| *len >= SMB2_HEADER_LEN)
+                .any(|len| verify(&entry[..len], &SIGNING_KEY, SigningAlgo::HmacSha256).is_ok())
+        }
+
+        // ── panic and deadline ───────────────────────────────────────────
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn panicking_dispatch_is_answered_and_the_barrier_proceeds() {
+            let (server, incidents) = short_server();
+            let (handle, _entered) = fault_handle(Fault::Panic);
+            let (conn, session_id, tree_id, file_ids) =
+                seeded_connection(&server, vec![handle]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            let hdr = header(Command::Read, 41, session_id, tree_id);
+            wire.send(&read_request_payload(&hdr, file_ids[0])).await;
+
+            let started = std::time::Instant::now();
+            let response = wire
+                .recv(DEADLINE / 2)
+                .await
+                .frame("a panicking READ must be answered well before the deadline");
+            assert!(started.elapsed() < DEADLINE / 2);
+            assert_eq!(header_command(&response), Command::Read as u16);
+            assert_eq!(status_of(&response), STATUS_INTERNAL_ERROR);
+
+            wire.assert_barrier_answered(42, (session_id, tree_id))
+                .await;
+
+            let panicked = incidents.of_kind(is_panicked);
+            assert_eq!(panicked.len(), 1, "exactly one Panicked incident");
+            let incident = &panicked[0];
+            assert!(matches!(
+                &incident.kind,
+                IncidentKind::Panicked { message } if message.contains("handler exploded")
+            ));
+            assert_eq!(incident.command, Some("Read"));
+            assert_eq!(incident.message_id, Some(41));
+            assert_eq!(incident.path.as_deref(), Some("block.txt"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn never_completing_dispatch_times_out_and_the_barrier_proceeds() {
+            let (fault, dropped) = never_fault();
+            let (handle, _entered) = fault_handle(fault);
+            let (mut state, incidents) = supervised_server(DEADLINE, SLOW, GRACE);
+            let flag_sink = Arc::new(FlagAtTreeDisconnect {
+                flag: dropped.clone(),
+                seen: StdMutex::new(None),
+            });
+            state.trace_sink = Some(flag_sink.clone());
+            let server = Arc::new(state);
+            let (conn, session_id, tree_id, file_ids) =
+                seeded_connection(&server, vec![handle]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            let hdr = header(Command::Read, 51, session_id, tree_id);
+            wire.send(&read_request_payload(&hdr, file_ids[0])).await;
+
+            let started = std::time::Instant::now();
+            let response = wire
+                .recv(DEADLINE + GRACE + Duration::from_secs(1))
+                .await
+                .frame("a never-completing READ must be answered at its deadline");
+            let elapsed = started.elapsed();
+            assert_eq!(status_of(&response), STATUS_IO_TIMEOUT);
+            assert!(
+                elapsed >= DEADLINE - Duration::from_millis(50),
+                "answered before the deadline: {elapsed:?}"
+            );
+            assert!(
+                elapsed < DEADLINE + GRACE,
+                "answered later than deadline + grace: {elapsed:?}"
+            );
+
+            wire.assert_barrier_answered(52, (session_id, tree_id))
+                .await;
+            assert_eq!(
+                *flag_sink.seen.lock().unwrap(),
+                Some(true),
+                "the abandoned handler's future must be dropped before the TREE_DISCONNECT runs"
+            );
+
+            let slow = incidents.of_kind(is_slow);
+            let timed_out = incidents.of_kind(is_timed_out);
+            assert_eq!(slow.len(), 1, "one Slow incident");
+            assert_eq!(timed_out.len(), 1, "one TimedOut incident");
+            assert_eq!(slow[0].path.as_deref(), Some("block.txt"));
+            assert_eq!(identity(&slow[0]), identity(&timed_out[0]));
+            assert_eq!(slow[0].message_id, Some(51));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn non_yielding_handler_closes_the_connection_after_the_grace() {
+            let (server, incidents) = short_server();
+            let block = DEADLINE + GRACE + Duration::from_secs(1);
+            let (handle, mut entered) = fault_handle(Fault::SyncBlock(block));
+            let (conn, session_id, tree_id, file_ids) =
+                seeded_connection(&server, vec![handle]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            let started = std::time::Instant::now();
+            let hdr = header(Command::Read, 61, session_id, tree_id);
+            wire.send(&read_request_payload(&hdr, file_ids[0])).await;
+            assert!(recv_within(&mut entered, Duration::from_secs(5)).await);
+            let td = header(Command::TreeDisconnect, 62, session_id, tree_id);
+            wire.send(&tree_disconnect_payload(&td)).await;
+
+            match wire.recv(block - Duration::from_millis(100)).await {
+                Recv::Eof => {}
+                Recv::Frame(_) => panic!("a response arrived instead of the close"),
+                Recv::Silent => panic!(
+                    "the connection was not closed after deadline + grace; incidents: {:?}",
+                    incidents.all()
+                ),
+            }
+            let closed_after = started.elapsed();
+            assert!(
+                closed_after >= DEADLINE + GRACE - Duration::from_millis(50),
+                "closed before deadline + grace: {closed_after:?}"
+            );
+            assert!(
+                !wire.reader.is_finished(),
+                "reader_task must not return while the abandoned handler still runs"
+            );
+
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut wire.reader)
+                .await
+                .expect("reader_task returns once the sleep ends")
+                .expect("join");
+            assert!(result.is_ok());
+            assert!(started.elapsed() >= block - Duration::from_millis(50));
+            assert!(
+                !incidents.of_kind(is_closed).is_empty(),
+                "a ConnectionClosed incident"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn timeout_response_is_built_while_session_state_is_contended() {
+            let (fault, _dropped) = never_fault();
+            let (handle, _entered) = fault_handle(fault);
+            let (server, _incidents) = short_server();
+            let backend = HandleBackend {
+                make: Box::new(|| unreachable!("no CREATE in this test")),
+            };
+            let (conn, session_id, tree_id) = signed_connection_over(backend).await;
+            // Seed an open the READ can target.
+            let tree = crate::tests::handler_support::tree_of(&conn, session_id, tree_id).await;
+            let file_id = {
+                let tree = tree.read().await;
+                let file_id = tree.alloc_file_id();
+                let open = Open::new(
+                    file_id,
+                    handle,
+                    Access::ReadWrite,
+                    "block.txt".parse().expect("path"),
+                    false,
+                    false,
+                );
+                tree.opens
+                    .write()
+                    .await
+                    .insert(file_id, Arc::new(RwLock::new(open)));
+                file_id
+            };
+            let session = conn
+                .sessions
+                .read()
+                .await
+                .get(&session_id)
+                .cloned()
+                .expect("session");
+            let mut wire = spawn_wire(server, conn.clone()).await;
+
+            // Contend the session state from before the READ is admitted until
+            // after the deadline.
+            let sessions_guard = conn.sessions.write().await;
+            let session_guard = session.write().await;
+
+            let mut hdr = header(Command::Read, 71, session_id, tree_id);
+            hdr.flags |= SMB2_FLAGS_SIGNED;
+            let mut payload = read_request_payload(&hdr, file_id);
+            sign(&mut payload, &SIGNING_KEY, SigningAlgo::HmacSha256).expect("sign");
+            wire.send(&payload).await;
+
+            let response = wire
+                .recv(DEADLINE + GRACE + Duration::from_secs(1))
+                .await
+                .frame("the timeout response must not wait for the contended session state");
+            assert_eq!(status_of(&response), STATUS_IO_TIMEOUT);
+            assert!(
+                signature_valid(&response),
+                "the timeout response of a signed session must be correctly signed"
+            );
+
+            drop(session_guard);
+            drop(sessions_guard);
+            wire.assert_barrier_answered(72, (session_id, tree_id))
+                .await;
+        }
+
+        // ── compounds ────────────────────────────────────────────────────
+
+        /// CREATE + related READ + related CLOSE, signed, with the all-ones
+        /// sentinels a client puts on the related requests; every handle the
+        /// backend yields is `fault`.
+        async fn run_signed_create_read_close(
+            fault: impl Fn() -> Fault + Send + Sync + 'static,
+        ) -> (Vec<Vec<u8>>, Arc<RecordedIncidents>, usize, (u64, u32)) {
+            let (server, incidents) = short_server();
+            let backend = HandleBackend {
+                make: Box::new(move || fault_handle(fault()).0),
+            };
+            let (conn, session_id, tree_id) = signed_connection_over(backend).await;
+            let mut wire = spawn_wire(server, conn.clone()).await;
+
+            let create_hdr = header(Command::Create, 81, session_id, tree_id);
+            let create_body = create_request("hang.txt", 0, 1, 0x1);
+            let read_hdr = sentinel_header(Command::Read, 82);
+            let close_hdr = sentinel_header(Command::Close, 83);
+            let frame = compound(
+                vec![
+                    (create_hdr, create_body),
+                    (read_hdr, read_body(FileId::any())),
+                    (close_hdr, close_request(FileId::any())),
+                ],
+                Some(SIGNING_KEY),
+            );
+            wire.send(&frame).await;
+
+            let response = wire
+                .recv(DEADLINE + 3 * GRACE + Duration::from_secs(1))
+                .await
+                .frame("the compound response");
+            let entries = response_entries(&response);
+            // Counted before the barrier frame, which tears the tree down.
+            let opens = crate::tests::handler_support::open_count(&conn, session_id, tree_id).await;
+            wire.assert_barrier_answered(84, (session_id, tree_id))
+                .await;
+            (entries, incidents, opens, (session_id, tree_id))
+        }
+
+        fn assert_prefix_kept_and_rest_run(
+            entries: &[Vec<u8>],
+            ids: (u64, u32),
+            expected_middle: u32,
+        ) {
+            assert_eq!(entries.len(), 3, "one compound response with three entries");
+            assert_eq!(status_of(&entries[0]), STATUS_SUCCESS, "CREATE kept");
+            assert_eq!(status_of(&entries[1]), expected_middle, "READ");
+            assert_eq!(status_of(&entries[2]), STATUS_SUCCESS, "CLOSE ran");
+            for (position, entry) in entries.iter().enumerate() {
+                assert_eq!(session_id_of(entry), ids.0, "entry {position}: session id");
+                assert_eq!(tree_id_of(entry), ids.1, "entry {position}: tree id");
+                assert!(signature_valid(entry), "entry {position}: signature");
+            }
+        }
+
+        fn assert_attributed_to_the_read(incident: &Incident) {
+            assert_eq!(incident.command, Some("Read"));
+            assert_eq!(incident.message_id, Some(82));
+            assert_eq!(incident.compound_ordinal, Some(1));
+            assert_eq!(incident.path.as_deref(), Some("hang.txt"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn signed_related_compound_keeps_completed_prefix_and_runs_the_rest() {
+            let (entries, incidents, opens, ids) =
+                run_signed_create_read_close(|| never_fault().0).await;
+            assert_prefix_kept_and_rest_run(&entries, ids, STATUS_IO_TIMEOUT);
+            assert_eq!(opens, 0, "the CLOSE released the Open the CREATE made");
+
+            let slow = incidents.of_kind(is_slow);
+            let timed_out = incidents.of_kind(is_timed_out);
+            assert_eq!(slow.len(), 1);
+            assert_eq!(timed_out.len(), 1);
+            assert_attributed_to_the_read(&slow[0]);
+            assert_attributed_to_the_read(&timed_out[0]);
+            assert_eq!(identity(&slow[0]), identity(&timed_out[0]));
+            assert!(
+                incidents
+                    .all()
+                    .iter()
+                    .all(|i| i.command != Some("Create") && i.command != Some("Close")),
+                "no incident names the CREATE or the CLOSE"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn signed_related_compound_panic_keeps_completed_prefix() {
+            let (entries, incidents, _opens, ids) =
+                run_signed_create_read_close(|| Fault::Panic).await;
+            assert_prefix_kept_and_rest_run(&entries, ids, STATUS_INTERNAL_ERROR);
+
+            let panicked = incidents.of_kind(is_panicked);
+            assert_eq!(panicked.len(), 1, "a single Panicked incident");
+            assert_attributed_to_the_read(&panicked[0]);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn compound_of_pending_reads_is_answered_within_one_budget() {
+            let (server, incidents) = short_server();
+            let mut handles = Vec::new();
+            let mut entries_rx = Vec::new();
+            for _ in 0..3 {
+                let (fault, _dropped) = never_fault();
+                let (handle, entered) = fault_handle(fault);
+                handles.push(handle);
+                entries_rx.push(entered);
+            }
+            let (conn, session_id, tree_id, file_ids) = seeded_connection(&server, handles).await;
+            let mut wire = spawn_wire(server, conn.clone()).await;
+
+            let mut parts = Vec::new();
+            for (index, file_id) in file_ids.iter().enumerate() {
+                parts.push((
+                    header(Command::Read, 90 + index as u64, session_id, tree_id),
+                    read_body(*file_id),
+                ));
+            }
+            parts.push((
+                header(Command::Close, 93, session_id, tree_id),
+                close_request(file_ids[0]),
+            ));
+            let started = std::time::Instant::now();
+            wire.send(&compound(parts, None)).await;
+
+            let response = wire
+                .recv(DEADLINE + 3 * GRACE + Duration::from_secs(1))
+                .await
+                .frame("the compound of pending READs");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= DEADLINE - Duration::from_millis(50)
+                    && elapsed < DEADLINE * 2 - Duration::from_millis(100),
+                "answered within one budget, not one per READ: {elapsed:?}"
+            );
+            let entries = response_entries(&response);
+            let statuses: Vec<u32> = entries.iter().map(|e| status_of(e)).collect();
+            assert_eq!(
+                statuses,
+                vec![
+                    STATUS_IO_TIMEOUT,
+                    STATUS_IO_TIMEOUT,
+                    STATUS_IO_TIMEOUT,
+                    STATUS_SUCCESS
+                ]
+            );
+            assert!(
+                entries_rx[0].try_recv().is_ok(),
+                "READ 1 entered its handler"
+            );
+            assert!(
+                entries_rx[1].try_recv().is_err() && entries_rx[2].try_recv().is_err(),
+                "READs 2 and 3 are answered without being executed"
+            );
+            assert_eq!(
+                crate::tests::handler_support::open_count(&conn, session_id, tree_id).await,
+                2,
+                "the CLOSE executed: only READ 1's open is gone"
+            );
+            let timed_out = incidents.of_kind(is_timed_out);
+            assert_eq!(timed_out.len(), 1, "READ 1 has a TimedOut incident");
+            assert_eq!(timed_out[0].message_id, Some(90));
+
+            wire.assert_barrier_answered(94, (session_id, tree_id))
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn reused_message_id_keeps_distinct_identities() {
+            let (server, incidents) = short_server();
+            let (fault, _dropped) = never_fault();
+            let (handle, _entered) = fault_handle(fault);
+            let (conn, session_id, tree_id, file_ids) =
+                seeded_connection(&server, vec![handle]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            let frame = compound(
+                vec![
+                    (header(Command::Echo, 5, session_id, tree_id), echo_body()),
+                    (
+                        header(Command::Read, 5, session_id, tree_id),
+                        read_body(file_ids[0]),
+                    ),
+                ],
+                None,
+            );
+            wire.send(&frame).await;
+            let response = wire
+                .recv(DEADLINE + 3 * GRACE + Duration::from_secs(1))
+                .await
+                .frame("the compound response");
+            let entries = response_entries(&response);
+            assert_eq!(status_of(&entries[0]), STATUS_SUCCESS);
+            assert_eq!(status_of(&entries[1]), STATUS_IO_TIMEOUT);
+
+            let slow = incidents.of_kind(is_slow);
+            let timed_out = incidents.of_kind(is_timed_out);
+            assert_eq!(slow.len(), 1);
+            assert_eq!(timed_out.len(), 1);
+            assert_eq!(slow[0].compound_ordinal, Some(1));
+            assert_eq!(timed_out[0].compound_ordinal, Some(1));
+            assert!(
+                incidents
+                    .all()
+                    .iter()
+                    .all(|i| i.compound_ordinal != Some(0)),
+                "no incident carries ordinal 0"
+            );
+            assert_eq!(identity(&slow[0]), identity(&timed_out[0]));
+            wire.assert_barrier_answered(6, (session_id, tree_id)).await;
+        }
+
+        // ── malformed frames ─────────────────────────────────────────────
+
+        async fn expect_closed_without_response(wire: &mut Wire, what: &str) {
+            match wire.recv(Duration::from_secs(3)).await {
+                Recv::Eof => {}
+                Recv::Frame(_) => panic!("{what}: a response arrived, the connection must close"),
+                Recv::Silent => panic!("{what}: the connection stayed open and silent"),
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn malformed_frame_closes_the_connection() {
+            let (server, incidents) = short_server();
+            let (conn, session_id, tree_id, _files) = seeded_connection(&server, vec![]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            // A valid length prefix over a header whose command opcode is unknown.
+            let mut garbled =
+                frame_payload(&header(Command::Echo, 1, session_id, tree_id), &[0; 4]);
+            garbled[12] = 0xFF;
+            garbled[13] = 0xFF;
+            wire.send(&garbled).await;
+            let td = header(Command::TreeDisconnect, 2, session_id, tree_id);
+            wire.send(&tree_disconnect_payload(&td)).await;
+
+            expect_closed_without_response(&mut wire, "a header that does not parse").await;
+            let malformed = incidents.of_kind(is_malformed);
+            assert_eq!(malformed.len(), 1);
+            assert!(matches!(
+                &malformed[0].kind,
+                IncidentKind::MalformedFrame { reason } if !reason.is_empty()
+            ));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn next_command_at_frame_end_is_malformed() {
+            let (server, incidents) = short_server();
+            let (conn, session_id, tree_id, _files) = seeded_connection(&server, vec![]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            let mut hdr = header(Command::Echo, 1, session_id, tree_id);
+            let length = SMB2_HEADER_LEN + echo_body().len();
+            hdr.next_command = length as u32;
+            wire.send(&frame_payload(&hdr, &echo_body())).await;
+
+            expect_closed_without_response(&mut wire, "NextCommand at the frame end").await;
+            assert_eq!(incidents.of_kind(is_malformed).len(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn short_compound_tail_is_malformed_and_runs_nothing() {
+            let (server, incidents) = short_server();
+            let release = Arc::new(Notify::new());
+            let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+            let (conn, session_id, tree_id, file_ids) =
+                seeded_connection(&server, vec![blocking_handle(release.clone(), entered_tx)])
+                    .await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            let read_hdr = header(Command::Read, 1, session_id, tree_id);
+            let mut frame = compound(
+                vec![
+                    (read_hdr, read_body(file_ids[0])),
+                    (header(Command::Echo, 2, session_id, tree_id), echo_body()),
+                ],
+                None,
+            );
+            // Cut the second element down to fewer bytes than a header.
+            let second_start = read_u32(&frame, 0x14) as usize;
+            frame.truncate(second_start + SMB2_HEADER_LEN - 30);
+            wire.send(&frame).await;
+
+            expect_closed_without_response(&mut wire, "a compound tail shorter than a header")
+                .await;
+            assert!(
+                entered_rx.try_recv().is_err(),
+                "the READ handler must never be entered"
+            );
+            assert_eq!(incidents.of_kind(is_malformed).len(), 1);
+            release.notify_waiters();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn invalid_frame_length_header_is_a_malformed_incident() {
+            let (server, incidents) = short_server();
+            let (conn, _session_id, _tree_id, _files) = seeded_connection(&server, vec![]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            // The NetBIOS session-message type byte must be zero.
+            wire.send_raw(&[0x01, 0x00, 0x00, 0x04, 0, 0, 0, 0]).await;
+
+            expect_closed_without_response(&mut wire, "an undecodable framing header").await;
+            let malformed = incidents.of_kind(is_malformed);
+            assert_eq!(
+                malformed.len(),
+                1,
+                "a MalformedFrame incident for the framing error"
+            );
+        }
+
+        // ── load and barrier frames ──────────────────────────────────────
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn sixty_four_hung_dispatches_do_not_stall_the_connection() {
+            let (server, _incidents) = short_server();
+            let (fault, _dropped) = never_fault();
+            let (handle, _entered) = fault_handle(fault);
+            let (conn, session_id, tree_id, file_ids) =
+                seeded_connection(&server, vec![handle]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            for i in 0..MAX_INFLIGHT as u64 {
+                let hdr = header(Command::Read, 100 + i, session_id, tree_id);
+                wire.send(&read_request_payload(&hdr, file_ids[0])).await;
+            }
+            let echo = header(Command::Echo, 999, session_id, tree_id);
+            wire.send(&echo_payload(&echo)).await;
+
+            let mut timed_out = 0;
+            let mut echoed = false;
+            for _ in 0..=MAX_INFLIGHT {
+                let response = wire
+                    .recv(Duration::from_secs(10))
+                    .await
+                    .frame("every READ and the ECHO behind them are answered");
+                match header_command(&response) {
+                    c if c == Command::Read as u16 => {
+                        assert_eq!(status_of(&response), STATUS_IO_TIMEOUT);
+                        timed_out += 1;
+                    }
+                    c if c == Command::Echo as u16 => {
+                        assert_eq!(status_of(&response), STATUS_SUCCESS);
+                        echoed = true;
+                    }
+                    other => panic!("unexpected response command {other}"),
+                }
+            }
+            assert_eq!(timed_out, MAX_INFLIGHT);
+            assert!(echoed);
+            wire.assert_barrier_answered(1000, (session_id, tree_id))
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn panic_in_a_serialized_frame_does_not_kill_the_reader() {
+            let (server, incidents) = short_server();
+            let (handle, _entered) = fault_handle(Fault::PanicOnClose);
+            let (conn, session_id, tree_id, _files) =
+                seeded_connection(&server, vec![handle]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            // The TREE_DISCONNECT is a serialized frame whose handler closes
+            // the tree's opens, and the open's `close` panics.
+            let td = header(Command::TreeDisconnect, 1, session_id, tree_id);
+            wire.send(&tree_disconnect_payload(&td)).await;
+            let response = wire
+                .recv(Duration::from_secs(3))
+                .await
+                .frame("a panicking serialized frame must be answered");
+            assert_eq!(header_command(&response), Command::TreeDisconnect as u16);
+            assert_eq!(status_of(&response), STATUS_INTERNAL_ERROR);
+
+            let echo = header(Command::Echo, 2, session_id, tree_id);
+            wire.send(&echo_payload(&echo)).await;
+            let response = wire
+                .recv(Duration::from_secs(3))
+                .await
+                .frame("the reader must survive the panic and answer the next frame");
+            assert_eq!(header_command(&response), Command::Echo as u16);
+            assert_eq!(status_of(&response), STATUS_SUCCESS);
+            assert_eq!(incidents.of_kind(is_panicked).len(), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn slow_dispatch_that_finishes_reports_finished() {
+            let (server, incidents) = short_server();
+            let release = Arc::new(Notify::new());
+            let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+            let (conn, session_id, tree_id, file_ids) =
+                seeded_connection(&server, vec![blocking_handle(release.clone(), entered_tx)])
+                    .await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            let hdr = header(Command::Read, 31, session_id, tree_id);
+            wire.send(&read_request_payload(&hdr, file_ids[0])).await;
+            assert!(recv_within(&mut entered_rx, Duration::from_secs(5)).await);
+
+            // Past the threshold, before the deadline.
+            tokio::time::sleep(SLOW * 2).await;
+            release.notify_waiters();
+
+            let response = wire
+                .recv(Duration::from_secs(3))
+                .await
+                .frame("the released READ");
+            assert_eq!(status_of(&response), STATUS_SUCCESS);
+
+            let all = incidents.all();
+            assert_eq!(all.len(), 2, "Slow, then Finished: {all:?}");
+            assert!(matches!(all[0].kind, IncidentKind::Slow));
+            assert!(matches!(
+                all[1].kind,
+                IncidentKind::Finished { elapsed } if elapsed >= SLOW
+            ));
+            assert_eq!(identity(&all[0]), identity(&all[1]));
+            assert_eq!(all[0].message_id, Some(31));
+            wire.assert_barrier_answered(32, (session_id, tree_id))
+                .await;
+        }
     }
 }

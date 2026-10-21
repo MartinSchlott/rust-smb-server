@@ -1,6 +1,7 @@
 //! Per-frame dispatch: parse header, route to handler, sign response, encode.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::proto::auth::ntlm::Identity;
 use crate::proto::crypto::{PreauthIntegrity, sign};
@@ -8,11 +9,13 @@ use crate::proto::header::{
     Command, HeaderTail, SMB2_FLAGS_ASYNC_COMMAND, SMB2_FLAGS_RELATED_OPERATIONS,
     SMB2_FLAGS_SERVER_TO_REDIR, SMB2_FLAGS_SIGNED, SMB2_HEADER_LEN, SMB2_MAGIC, Smb2Header,
 };
-use crate::proto::messages::ErrorResponse;
+use crate::proto::messages::{CreateRequest, Dialect, ErrorResponse, FileId};
+use tokio::time::Instant;
 use tracing::{Instrument, debug, debug_span, error, warn};
 
 use crate::conn::state::Connection;
 use crate::handlers;
+use crate::incident::{Incident, IncidentKind};
 use crate::ntstatus;
 use crate::server::ServerState;
 
@@ -68,26 +71,247 @@ impl HandlerResponse {
     }
 }
 
-/// Top-level frame dispatch. Returns the bytes to push into the writer
-/// channel, or `None` if the request elicits no response (CANCEL).
+/// What dispatching one frame produced.
+pub enum FrameOutcome {
+    /// The bytes to push into the writer channel.
+    Response(Vec<u8>),
+    /// The frame elicits no response: a CANCEL, which the protocol leaves
+    /// unanswered, or a frame whose handler could not be stopped, for which
+    /// the connection has already been closed instead.
+    NoResponse,
+    /// The frame's framing or compound chain is malformed. Nothing in it was
+    /// executed; the caller closes the connection.
+    Malformed { reason: String },
+}
+
+/// One sub-request's position in a validated frame.
+struct ChainEntry {
+    offset: usize,
+    /// The sub-request's length including its alignment padding: up to
+    /// `NextCommand`, or to the end of the frame for the last one.
+    len: usize,
+    header: Smb2Header,
+}
+
+/// Walks and validates the whole compound chain of `frame`, before anything
+/// is dispatched. The reader's classification and `dispatch_frame` both go
+/// through here, so they cannot disagree about what a frame is.
+///
+/// A frame is malformed when it is shorter than a header, a sub-header does
+/// not parse, a non-zero `NextCommand` is below the header length, or a
+/// non-zero `NextCommand` leaves fewer than a header's worth of bytes for the
+/// sub-request it promises. The last rule covers an offset landing exactly at
+/// the end of the frame: a chain that promises another header must have one.
+fn validate_chain(frame: &[u8]) -> Result<Vec<ChainEntry>, String> {
+    if frame.len() < SMB2_HEADER_LEN {
+        return Err(format!(
+            "frame of {} bytes is shorter than an SMB2 header",
+            frame.len()
+        ));
+    }
+
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    loop {
+        // The initial length check and the previous iteration's
+        // `NextCommand` check guarantee a full header here.
+        let available = &frame[offset..];
+        let (header, _) = Smb2Header::parse(available).map_err(|e| {
+            format!(
+                "header of sub-request {} does not parse: {e}",
+                entries.len()
+            )
+        })?;
+
+        let next = header.next_command as usize;
+        if next == 0 {
+            entries.push(ChainEntry {
+                offset,
+                len: available.len(),
+                header,
+            });
+            return Ok(entries);
+        }
+        if next < SMB2_HEADER_LEN {
+            return Err(format!(
+                "sub-request {}: NextCommand {next} is below the header length",
+                entries.len()
+            ));
+        }
+        if next > available.len() || available.len() - next < SMB2_HEADER_LEN {
+            return Err(format!(
+                "sub-request {}: NextCommand {next} leaves fewer than {SMB2_HEADER_LEN} bytes \
+                 for the next header ({} bytes remain)",
+                entries.len(),
+                available.len()
+            ));
+        }
+        entries.push(ChainEntry {
+            offset,
+            len: next,
+            header,
+        });
+        offset += next;
+    }
+}
+
+/// The wire bytes of a sub-request next to its effective form.
+///
+/// `inherit_related_context` rewrites the SessionId, TreeId and FileId
+/// sentinels of a related sub-request. Signature verification and the
+/// preauth hash run on the bytes as the client sent them, routing and the
+/// handlers on the effective ones.
+struct SubFrames {
+    effective: Vec<u8>,
+    /// `Some` only when inheritance changed the bytes.
+    wire: Option<Vec<u8>>,
+}
+
+impl SubFrames {
+    fn wire(&self) -> &[u8] {
+        self.wire.as_deref().unwrap_or(&self.effective)
+    }
+}
+
+/// One sub-request as the supervisor sees it.
+struct SubRequest {
+    ordinal: u32,
+    /// The effective header (after related-context inheritance).
+    hdr: Smb2Header,
+    frames: Arc<SubFrames>,
+    trace_key: Option<crate::trace::TraceKey>,
+    inherited_failure: Option<u32>,
+}
+
+impl SubRequest {
+    fn incident(&self, conn: &Connection, kind: IncidentKind, path: Option<String>) -> Incident {
+        Incident {
+            at: SystemTime::now(),
+            connection_id: conn.connection_id,
+            kind,
+            command: Some(command_name(self.hdr.command)),
+            message_id: Some(self.hdr.message_id),
+            compound_ordinal: Some(self.ordinal),
+            path,
+        }
+    }
+
+    /// The path this sub-request concerns, resolved without waiting: a
+    /// CREATE's requested name, or the `Open`'s path for a command carrying a
+    /// FileId. `None` on any contention.
+    fn path_hint(&self, conn: &Connection) -> Option<String> {
+        let frame = &self.frames.effective;
+        if self.hdr.command == Command::Create {
+            let req = CreateRequest::parse(&frame[SMB2_HEADER_LEN..]).ok()?;
+            let units = crate::utils::utf16le_to_units(&req.name)?;
+            let path = crate::path::SmbPath::from_utf16(&units).ok()?;
+            return Some(path.display_backslash());
+        }
+
+        let offset = SMB2_HEADER_LEN + file_id_body_offset(self.hdr.command)?;
+        if offset + 16 > frame.len() {
+            return None;
+        }
+        let file_id = FileId::new(read_u64(frame, offset), read_u64(frame, offset + 8));
+        let session = conn
+            .sessions
+            .try_read()
+            .ok()?
+            .get(&self.hdr.session_id)?
+            .clone();
+        let tree = session
+            .try_read()
+            .ok()?
+            .trees
+            .try_read()
+            .ok()?
+            .get(&self.hdr.tree_id()?)?
+            .clone();
+        let open = tree
+            .try_read()
+            .ok()?
+            .opens
+            .try_read()
+            .ok()?
+            .get(&file_id)?
+            .clone();
+        let path = open.try_read().ok()?.last_path.display_backslash();
+        Some(path)
+    }
+}
+
+/// What the handler task produced, up to the session-key bookkeeping that
+/// follows the handler.
+enum Handled {
+    /// CANCEL: fire-and-forget, no response.
+    Cancel,
+    /// The request failed signature verification.
+    Rejected(HandlerResponse),
+    Done {
+        resp: HandlerResponse,
+        dialect: Option<Dialect>,
+        session_preauth: Option<PreauthIntegrity>,
+    },
+}
+
+/// How a supervised sub-request ended.
+enum Supervised {
+    Completed(Handled),
+    /// The handler panicked; the sub-request is answered with an error.
+    Panicked,
+    /// The frame's budget ran out and the handler was cancelled.
+    TimedOut,
+    /// The handler could not be stopped; the connection is closed and this
+    /// frame sends nothing more.
+    Abandoned,
+}
+
+/// Top-level frame dispatch.
+///
+/// Every sub-request is answered, or the connection is closed — never
+/// silence on an open connection:
+/// * the whole chain is validated first; a malformed frame executes nothing
+///   and is reported as [`FrameOutcome::Malformed`] for the caller to close;
+/// * each sub-request's handler runs as its own task under the frame's
+///   budget: a panic is answered `STATUS_INTERNAL_ERROR` at once, and a
+///   handler still running when the budget ends is cancelled and answered
+///   `STATUS_IO_TIMEOUT`;
+/// * once the budget is spent, the rest of the chain is answered
+///   `STATUS_IO_TIMEOUT` unexecuted, except CLOSEs, which still run — under
+///   one shared cleanup window — so no Open created earlier in the frame
+///   leaks;
+/// * a handler that does not stop within the cancellation grace is stuck in
+///   non-yielding code: the connection is closed and nothing more is sent.
+///
+/// The budget (`dispatch_deadline`) runs from this call, so it bounds the
+/// whole frame and the barrier wait behind it. Responses of sub-requests that
+/// completed before the failure are never discarded.
 pub async fn dispatch_frame(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     frame: &[u8],
-) -> Option<Vec<u8>> {
+) -> FrameOutcome {
+    let admitted = Instant::now();
+
     // SMB1 multi-protocol bootstrap (MS-SMB2 §3.3.5.3.1). The only SMB1 we
     // accept: a NEGOTIATE_REQUEST listing "SMB 2.???" or "SMB 2.002".
     // Reply with an SMB2 NEGOTIATE response and the client follows up with
     // a real SMB2 NEGOTIATE.
     if let Some(bytes) = handle_smb1_multi_protocol(server, conn, frame).await {
-        return Some(bytes);
+        return FrameOutcome::Response(bytes);
     }
-    if frame.len() < SMB2_HEADER_LEN {
-        warn!(len = frame.len(), "frame too short for SMB2 header");
-        return None;
-    }
+    let chain = match validate_chain(frame) {
+        Ok(chain) => chain,
+        Err(reason) => {
+            warn!(%reason, "malformed frame");
+            return FrameOutcome::Malformed { reason };
+        }
+    };
 
-    let mut sub_offset = 0;
+    let budget_end = admitted + server.dispatch_deadline;
+    // `Some` once the budget is spent: the one absolute cutoff all remaining
+    // CLOSEs share.
+    let mut cleanup_cutoff: Option<Instant> = None;
     let mut responses = Vec::new();
     let mut prev_session_id = 0;
     let mut prev_tree_id = 0;
@@ -95,38 +319,11 @@ pub async fn dispatch_frame(
     // Status of a failed CREATE earlier in the current related chain
     // (MS-SMB2 §3.3.5.2.7.2); see `related_create_failure`.
     let mut create_failure: Option<u32> = None;
-    let mut compound_ordinal: u32 = 0;
 
-    while sub_offset < frame.len() {
-        let available = &frame[sub_offset..];
-        if available.len() < SMB2_HEADER_LEN {
-            warn!(remaining = available.len(), "compound tail too short");
-            return None;
-        }
-
-        let (mut req_hdr, _) = match Smb2Header::parse(available) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %e, "failed to parse compound sub-header");
-                return None;
-            }
-        };
-
-        let next = req_hdr.next_command as usize;
-        let sub_len = if next == 0 {
-            available.len()
-        } else if next < SMB2_HEADER_LEN || next > available.len() {
-            warn!(
-                next,
-                remaining = available.len(),
-                "invalid compound NextCommand"
-            );
-            return None;
-        } else {
-            next
-        };
-
-        let mut sub_frame = available[..sub_len].to_vec();
+    for (index, entry) in chain.iter().enumerate() {
+        let ordinal = index as u32;
+        let mut effective = frame[entry.offset..entry.offset + entry.len].to_vec();
+        let mut req_hdr = entry.header;
         let related = req_hdr.flags & SMB2_FLAGS_RELATED_OPERATIONS != 0;
         if !related {
             // An unrelated operation opens a new chain; a CREATE failure in
@@ -134,9 +331,11 @@ pub async fn dispatch_frame(
             create_failure = None;
         }
         let inherited_failure = related_create_failure(related, req_hdr.command, create_failure);
+        let mut wire = None;
         if related {
+            wire = Some(effective.clone());
             inherit_related_context(
-                &mut sub_frame,
+                &mut effective,
                 &mut req_hdr,
                 prev_session_id,
                 prev_tree_id,
@@ -147,15 +346,68 @@ pub async fn dispatch_frame(
         prev_session_id = req_hdr.session_id;
         prev_tree_id = req_hdr.tree_id().unwrap_or(0);
 
-        if let Some(response) = dispatch_one(
-            server,
-            conn,
-            &sub_frame,
-            compound_ordinal,
+        let sub = SubRequest {
+            ordinal,
+            hdr: req_hdr,
+            frames: Arc::new(SubFrames { effective, wire }),
+            trace_key: server.trace_sink.as_ref().map(|_| crate::trace::TraceKey {
+                connection_id: conn.connection_id,
+                message_id: req_hdr.message_id,
+                compound_ordinal: ordinal,
+            }),
             inherited_failure,
-        )
-        .await
-        {
+        };
+        crate::trace::record(
+            &server.trace_sink,
+            sub.trace_key,
+            crate::trace::TraceEvent::Request {
+                cmd: command_name(req_hdr.command),
+                session_id: req_hdr.session_id,
+                tree_id: req_hdr.tree_id().unwrap_or(0),
+            },
+        );
+
+        if cleanup_cutoff.is_none() && Instant::now() >= budget_end {
+            cleanup_cutoff = Some(Instant::now() + server.cancellation_grace);
+        }
+        let deadline = match cleanup_cutoff {
+            None => Some(budget_end),
+            // Budget spent: only a CLOSE still within the cleanup window runs.
+            Some(cutoff) => (req_hdr.command == Command::Close
+                && sub.inherited_failure.is_none()
+                && Instant::now() < cutoff)
+                .then_some(cutoff),
+        };
+
+        let response = match deadline {
+            None => {
+                let status = sub.inherited_failure.unwrap_or(ntstatus::STATUS_IO_TIMEOUT);
+                Some(error_response(server, conn, &sub, status))
+            }
+            Some(deadline) => match run_supervised(server, conn, &sub, deadline).await {
+                Supervised::Completed(handled) => complete(server, conn, &sub, handled).await,
+                Supervised::Panicked => Some(error_response(
+                    server,
+                    conn,
+                    &sub,
+                    ntstatus::STATUS_INTERNAL_ERROR,
+                )),
+                Supervised::TimedOut => {
+                    if cleanup_cutoff.is_none() {
+                        cleanup_cutoff = Some(Instant::now() + server.cancellation_grace);
+                    }
+                    Some(error_response(
+                        server,
+                        conn,
+                        &sub,
+                        ntstatus::STATUS_IO_TIMEOUT,
+                    ))
+                }
+                Supervised::Abandoned => return FrameOutcome::NoResponse,
+            },
+        };
+
+        if let Some(response) = response {
             if req_hdr.command == Command::Create {
                 prev_create_file_id = capture_create_file_id(&response);
                 let status = read_u32(&response, 0x08);
@@ -163,19 +415,181 @@ pub async fn dispatch_frame(
             }
             responses.push(response);
         }
-        compound_ordinal = compound_ordinal.saturating_add(1);
-
-        if next == 0 {
-            break;
-        }
-        sub_offset += next;
     }
 
     if responses.is_empty() {
-        return None;
+        return FrameOutcome::NoResponse;
     }
 
-    Some(stitch_responses(conn, responses).await)
+    FrameOutcome::Response(stitch_responses(conn, responses))
+}
+
+/// Answers `sub` with `status` without running its handler (or after its
+/// handler was abandoned), recording the response in the trace.
+fn error_response(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    sub: &SubRequest,
+    status: u32,
+) -> Vec<u8> {
+    let bytes = build_response_bytes(conn, &sub.hdr, HandlerResponse::err(status));
+    crate::trace::record(
+        &server.trace_sink,
+        sub.trace_key,
+        crate::trace::TraceEvent::Response { status },
+    );
+    bytes
+}
+
+/// Runs `sub`'s handler as its own task and supervises it until `deadline`.
+///
+/// Reports `Slow` once the handler has run for the slow threshold, and
+/// `Finished` if it then completes. At the deadline the task is aborted and
+/// given the cancellation grace to drop its future and every lock guard it
+/// holds; a task that does not stop is stuck in non-yielding code, so the
+/// connection is closed and this call keeps awaiting the task — holding the
+/// frame's permit, so quiescence is preserved — without sending anything.
+async fn run_supervised(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    sub: &SubRequest,
+    deadline: Instant,
+) -> Supervised {
+    let span = debug_span!(
+        "dispatch",
+        cmd = ?sub.hdr.command,
+        mid = sub.hdr.message_id,
+        sid = sub.hdr.session_id,
+        tid = sub.hdr.tree_id().unwrap_or(0)
+    );
+    // Task-local trace correlation is not inherited across `tokio::spawn`.
+    let mut task = tokio::spawn(
+        crate::trace::scoped(
+            sub.trace_key,
+            handle_one(
+                server.clone(),
+                conn.clone(),
+                sub.hdr,
+                sub.frames.clone(),
+                sub.inherited_failure,
+            ),
+        )
+        .instrument(span),
+    );
+
+    // Held until this function returns — also while waiting out an abandoned
+    // handler — so the runtime's timers stay alive for as long as one runs.
+    let _in_flight = server.pulse.enter();
+    let started = Instant::now();
+    let slow_at = started + server.slow_dispatch_threshold;
+    let mut slow_reported = false;
+    let mut path: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            joined = &mut task => {
+                return finish_task(server, conn, sub, joined, slow_reported.then(|| started.elapsed()), path);
+            }
+            _ = tokio::time::sleep_until(slow_at), if !slow_reported && slow_at < deadline => {
+                slow_reported = true;
+                path = sub.path_hint(conn);
+                crate::supervise::emit(server, conn, sub.incident(conn, IncidentKind::Slow, path.clone()));
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+
+    task.abort();
+    match tokio::time::timeout(server.cancellation_grace, &mut task).await {
+        // A task that completed just before the abort landed is a normal
+        // completion; only a cancellation is a timeout.
+        Ok(Err(e)) if e.is_cancelled() => {
+            let path = path.or_else(|| sub.path_hint(conn));
+            crate::supervise::emit(
+                server,
+                conn,
+                sub.incident(conn, IncidentKind::TimedOut, path),
+            );
+            Supervised::TimedOut
+        }
+        Ok(joined) => finish_task(
+            server,
+            conn,
+            sub,
+            joined,
+            slow_reported.then(|| started.elapsed()),
+            path,
+        ),
+        Err(_) => {
+            let path = path.or_else(|| sub.path_hint(conn));
+            crate::supervise::emit(
+                server,
+                conn,
+                sub.incident(
+                    conn,
+                    IncidentKind::ConnectionClosed {
+                        reason: format!(
+                            "handler did not stop within the cancellation grace of {:?}",
+                            server.cancellation_grace
+                        ),
+                    },
+                    path,
+                ),
+            );
+            conn.close();
+            let _ = (&mut task).await;
+            Supervised::Abandoned
+        }
+    }
+}
+
+/// Maps a finished handler task onto the supervisor's outcomes.
+fn finish_task(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    sub: &SubRequest,
+    joined: Result<Handled, tokio::task::JoinError>,
+    slow_elapsed: Option<std::time::Duration>,
+    path: Option<String>,
+) -> Supervised {
+    match joined {
+        Ok(handled) => {
+            if let Some(elapsed) = slow_elapsed {
+                crate::supervise::emit(
+                    server,
+                    conn,
+                    sub.incident(conn, IncidentKind::Finished { elapsed }, path),
+                );
+            }
+            Supervised::Completed(handled)
+        }
+        Err(e) if e.is_panic() => {
+            let message = crate::supervise::panic_message(&*e.into_panic());
+            let path = path.or_else(|| sub.path_hint(conn));
+            crate::supervise::emit(
+                server,
+                conn,
+                sub.incident(conn, IncidentKind::Panicked { message }, path),
+            );
+            Supervised::Panicked
+        }
+        Err(_) => {
+            // Cancelled other than by us: the runtime is shutting down.
+            crate::supervise::emit(
+                server,
+                conn,
+                sub.incident(
+                    conn,
+                    IncidentKind::ConnectionClosed {
+                        reason: "handler task cancelled".to_owned(),
+                    },
+                    path,
+                ),
+            );
+            conn.close();
+            Supervised::Abandoned
+        }
+    }
 }
 
 fn inherit_related_context(
@@ -274,7 +688,7 @@ fn capture_create_file_id(response: &[u8]) -> Option<[u8; 16]> {
     Some(file_id)
 }
 
-async fn stitch_responses(conn: &Arc<Connection>, responses: Vec<Vec<u8>>) -> Vec<u8> {
+fn stitch_responses(conn: &Arc<Connection>, responses: Vec<Vec<u8>>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut ranges = Vec::with_capacity(responses.len());
     let response_count = responses.len();
@@ -294,7 +708,6 @@ async fn stitch_responses(conn: &Arc<Connection>, responses: Vec<Vec<u8>>) -> Ve
         }
     }
 
-    let algo = *conn.signing_algo.read().await;
     for (start, len) in ranges {
         let flags = read_u32(&out, start + 0x10);
         if flags & SMB2_FLAGS_SIGNED == 0 {
@@ -302,21 +715,15 @@ async fn stitch_responses(conn: &Arc<Connection>, responses: Vec<Vec<u8>>) -> Ve
         }
 
         let session_id = read_u64(&out, start + 0x28);
-        let key = {
-            let sessions = conn.sessions.read().await;
-            sessions.get(&session_id).cloned()
-        };
-        let Some(session) = key else {
+        let (algo, session) = conn.signing_context(session_id);
+        let Some(session) = session else {
             continue;
         };
-        let session = session.read().await;
-        if matches!(session.identity, Identity::Anonymous) {
+        if session.anonymous {
             continue;
         }
-        let signing_key = session.signing_key;
-        drop(session);
 
-        if let Err(e) = sign(&mut out[start..start + len], &signing_key, algo) {
+        if let Err(e) = sign(&mut out[start..start + len], &session.key, algo) {
             error!(error = %e, "failed to sign compound response");
         }
     }
@@ -350,199 +757,178 @@ fn read_u64(buf: &[u8], offset: usize) -> u64 {
 /// `session_preauth`, the `preauth` hash); LOGOFF and TREE_DISCONNECT tear
 /// down state an in-flight data operation may hold.
 ///
-/// Walks the **entire** `NextCommand` chain, not just the first header.
-/// MS-SMB2 permits compounding unrelated requests, and `dispatch_frame`
-/// dispatches every sub-header without filtering — so an `ECHO + LOGOFF`
-/// frame classified on its first header alone would be spawned and would
-/// tear a session down underneath outstanding READs.
+/// Walks the **entire** `NextCommand` chain, not just the first header,
+/// through the same `validate_chain` that `dispatch_frame` uses — so the two
+/// cannot disagree about what a frame is. MS-SMB2 permits compounding
+/// unrelated requests, and `dispatch_frame` dispatches every sub-header
+/// without filtering, so an `ECHO + LOGOFF` frame classified on its first
+/// header alone would be spawned and would tear a session down underneath
+/// outstanding READs.
 ///
-/// Also returns `true` for a frame shorter than `SMB2_HEADER_LEN`, a frame
-/// not beginning with the SMB2 magic (the SMB1 multi-protocol bootstrap),
-/// and any sub-header that fails to parse or whose `NextCommand` does not
-/// point at a complete subsequent header — deliberately stricter than
-/// `dispatch_frame`'s own guard, which tolerates `NextCommand` landing
-/// exactly at frame end by terminating its loop there. A chain promising a
-/// header that cannot exist must not take the concurrent path.
+/// Also returns `true` for a frame that `validate_chain` rejects (shorter
+/// than `SMB2_HEADER_LEN`, a sub-header that does not parse, a `NextCommand`
+/// that does not point at a complete subsequent header — including one
+/// landing exactly at the frame's end) and for a frame not beginning with the
+/// SMB2 magic (the SMB1 multi-protocol bootstrap). Such a frame takes the
+/// serialized path, where `dispatch_frame` reports it as malformed without
+/// executing anything and the connection is closed.
 pub(crate) fn frame_must_be_serialized(frame: &[u8]) -> bool {
     if frame.len() < SMB2_HEADER_LEN || frame[0..4] != SMB2_MAGIC {
         return true;
     }
 
-    let mut sub_offset = 0;
-    loop {
-        let available = &frame[sub_offset..];
-        if available.len() < SMB2_HEADER_LEN {
-            return true;
-        }
-        let (hdr, _) = match Smb2Header::parse(available) {
-            Ok(p) => p,
-            Err(_) => return true,
-        };
-
-        if matches!(
-            hdr.command,
-            Command::Negotiate
-                | Command::SessionSetup
-                | Command::Logoff
-                | Command::TreeConnect
-                | Command::TreeDisconnect
-        ) {
-            return true;
-        }
-
-        let next = hdr.next_command as usize;
-        // `NextCommand == 0` terminates the chain and is normal — it is how
-        // every ordinary single-command frame and every final compound
-        // element is encoded. It MUST NOT be treated as malformed.
-        if next == 0 {
-            return false;
-        }
-        if next < SMB2_HEADER_LEN
-            || next > available.len()
-            || available.len() - next < SMB2_HEADER_LEN
-        {
-            return true;
-        }
-        sub_offset += next;
+    match validate_chain(frame) {
+        Err(_) => true,
+        Ok(chain) => chain.iter().any(|entry| {
+            matches!(
+                entry.header.command,
+                Command::Negotiate
+                    | Command::SessionSetup
+                    | Command::Logoff
+                    | Command::TreeConnect
+                    | Command::TreeDisconnect
+            )
+        }),
     }
 }
 
-async fn dispatch_one(
-    server: &Arc<ServerState>,
-    conn: &Arc<Connection>,
-    frame: &[u8],
-    compound_ordinal: u32,
+/// The supervised part of one sub-request: signature verification through
+/// the session-key bookkeeping that follows the handler. Runs as its own task
+/// (see `run_supervised`), so every `.await` in here is a point at which the
+/// supervisor can cancel it.
+async fn handle_one(
+    server: Arc<ServerState>,
+    conn: Arc<Connection>,
+    req_hdr: Smb2Header,
+    frames: Arc<SubFrames>,
     inherited_failure: Option<u32>,
-) -> Option<Vec<u8>> {
-    let (req_hdr, body_bytes) = match Smb2Header::parse(frame) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "failed to parse header");
-            return None;
-        }
+) -> Handled {
+    let cmd = req_hdr.command;
+    debug!("dispatch start");
+
+    // Verify the signature on the request as the client sent it (when
+    // applicable); the session it names is the effective one.
+    if let Err(status) = verify_request_signature(&server, &conn, &req_hdr, frames.wire()).await {
+        return Handled::Rejected(HandlerResponse::err(status));
+    }
+
+    // CANCEL is fire-and-forget — no response.
+    if cmd == Command::Cancel {
+        debug!("CANCEL received; no response");
+        return Handled::Cancel;
+    }
+
+    let dialect = *conn.dialect.read().await;
+    let mut session_preauth = None;
+
+    // 3.1.1 preauth is connection-scoped for NEGOTIATE, then per
+    // SESSION_SETUP authentication exchange.
+    if cmd == Command::Negotiate {
+        let mut p = conn
+            .preauth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        p.update(frames.wire());
+    } else if cmd == Command::SessionSetup && dialect == Some(Dialect::Smb311) {
+        let mut p = take_session_preauth(&conn, req_hdr.session_id).await;
+        p.update(frames.wire());
+        session_preauth = Some(p);
+    }
+
+    let body_bytes = &frames.effective[SMB2_HEADER_LEN..];
+    let resp = match inherited_failure {
+        Some(status) => HandlerResponse::err(status),
+        None => handlers::dispatch_command(&server, &conn, &req_hdr, body_bytes).await,
     };
 
-    let cmd = req_hdr.command;
-    let mid = req_hdr.message_id;
-    let sid = req_hdr.session_id;
-    let tid = req_hdr.tree_id().unwrap_or(0);
+    // If the handler asked for a preauth snapshot (3.1.1), take it now.
+    if let Some(sid) = resp.take_preauth_snapshot_for_session {
+        let snap = session_preauth
+            .as_ref()
+            .expect("SMB 3.1.1 SessionSetup snapshot requires per-session preauth")
+            .snapshot();
+        // Stash on the session — the handler already created it.
+        let sessions = conn.sessions.read().await;
+        if let Some(sess_arc) = sessions.get(&sid) {
+            let mut sess = sess_arc.write().await;
+            sess.preauth_snapshot = Some(snap);
+            // For 3.1.1, recompute signing key now that we have the snapshot.
+            let dialect = *conn.dialect.read().await;
+            if dialect == Some(Dialect::Smb311) {
+                sess.signing_key =
+                    crate::proto::crypto::signing_key_311(&sess.session_base_key, &snap);
+                conn.snapshot_session(sid, sess.signing_key, sess.is_anonymous());
+            }
+        }
+    }
 
-    let trace_key = server.trace_sink.as_ref().map(|_| crate::trace::TraceKey {
-        connection_id: conn.connection_id,
-        message_id: mid,
-        compound_ordinal,
-    });
-    crate::trace::record(
-        &server.trace_sink,
-        trace_key,
-        crate::trace::TraceEvent::Request {
-            cmd: command_name(cmd),
-            session_id: sid,
-            tree_id: tid,
-        },
-    );
+    Handled::Done {
+        resp,
+        dialect,
+        session_preauth,
+    }
+}
 
-    let span = debug_span!("dispatch", cmd = ?cmd, mid, sid, tid);
-    crate::trace::scoped(trace_key, async move {
-        debug!("dispatch start");
-
-        // Verify signature on incoming request (when applicable).
-        if let Err(status) = verify_request_signature(server, conn, &req_hdr, frame).await {
-            let bytes = build_response_bytes(conn, &req_hdr, HandlerResponse::err(status)).await;
+/// Builds `sub`'s response from what its handler produced and finishes the
+/// preauth bookkeeping that depends on the response bytes. Returns `None` for
+/// a CANCEL.
+async fn complete(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    sub: &SubRequest,
+    handled: Handled,
+) -> Option<Vec<u8>> {
+    let req_hdr = &sub.hdr;
+    let (resp, dialect, session_preauth) = match handled {
+        Handled::Cancel => return None,
+        Handled::Rejected(resp) => {
+            let status = resp.status;
+            let bytes = build_response_bytes(conn, req_hdr, resp);
             crate::trace::record(
                 &server.trace_sink,
-                trace_key,
+                sub.trace_key,
                 crate::trace::TraceEvent::Response { status },
             );
             return Some(bytes);
         }
+        Handled::Done {
+            resp,
+            dialect,
+            session_preauth,
+        } => (resp, dialect, session_preauth),
+    };
 
-        // CANCEL is fire-and-forget — no response.
-        if cmd == Command::Cancel {
-            debug!("CANCEL received; no response");
-            return None;
-        }
+    let bytes = build_response_bytes(conn, req_hdr, resp);
+    crate::trace::record(
+        &server.trace_sink,
+        sub.trace_key,
+        crate::trace::TraceEvent::Response {
+            status: read_u32(&bytes, 0x08),
+        },
+    );
 
-        let dialect = *conn.dialect.read().await;
-        let mut session_preauth = None;
-
-        // 3.1.1 preauth is connection-scoped for NEGOTIATE, then per
-        // SESSION_SETUP authentication exchange.
-        if cmd == Command::Negotiate {
-            let mut p = conn
-                .preauth
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            p.update(frame);
-        } else if cmd == Command::SessionSetup
-            && dialect == Some(crate::proto::messages::Dialect::Smb311)
-        {
-            let mut p = take_session_preauth(conn, req_hdr.session_id).await;
-            p.update(frame);
-            session_preauth = Some(p);
-        }
-
-        let resp = match inherited_failure {
-            Some(status) => HandlerResponse::err(status),
-            None => handlers::dispatch_command(server, conn, &req_hdr, body_bytes).await,
-        };
-
-        // If the handler asked for a preauth snapshot (3.1.1), take it now.
-        if let Some(sid) = resp.take_preauth_snapshot_for_session {
-            let snap = session_preauth
-                .as_ref()
-                .expect("SMB 3.1.1 SessionSetup snapshot requires per-session preauth")
-                .snapshot();
-            // Stash on the session — the handler already created it.
-            let sessions = conn.sessions.read().await;
-            if let Some(sess_arc) = sessions.get(&sid) {
-                let mut sess = sess_arc.write().await;
-                sess.preauth_snapshot = Some(snap);
-                // For 3.1.1, recompute signing key now that we have the snapshot.
-                let dialect = *conn.dialect.read().await;
-                if dialect == Some(crate::proto::messages::Dialect::Smb311) {
-                    sess.signing_key =
-                        crate::proto::crypto::signing_key_311(&sess.session_base_key, &snap);
-                }
+    if req_hdr.command == Command::Negotiate {
+        let mut p = conn
+            .preauth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        p.update(&bytes);
+    } else if req_hdr.command == Command::SessionSetup && dialect == Some(Dialect::Smb311) {
+        if read_u32(&bytes, 0x08) == ntstatus::STATUS_MORE_PROCESSING_REQUIRED {
+            if let Some(mut p) = session_preauth {
+                p.update(&bytes);
+                let sid = read_u64(&bytes, 0x28);
+                conn.session_preauth.write().await.insert(sid, p);
             }
+        } else {
+            conn.session_preauth
+                .write()
+                .await
+                .remove(&req_hdr.session_id);
         }
+    }
 
-        let bytes = build_response_bytes(conn, &req_hdr, resp).await;
-        crate::trace::record(
-            &server.trace_sink,
-            trace_key,
-            crate::trace::TraceEvent::Response {
-                status: read_u32(&bytes, 0x08),
-            },
-        );
-
-        if cmd == Command::Negotiate {
-            let mut p = conn
-                .preauth
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            p.update(&bytes);
-        } else if cmd == Command::SessionSetup
-            && dialect == Some(crate::proto::messages::Dialect::Smb311)
-        {
-            if read_u32(&bytes, 0x08) == ntstatus::STATUS_MORE_PROCESSING_REQUIRED {
-                if let Some(mut p) = session_preauth {
-                    p.update(&bytes);
-                    let sid = read_u64(&bytes, 0x28);
-                    conn.session_preauth.write().await.insert(sid, p);
-                }
-            } else {
-                conn.session_preauth
-                    .write()
-                    .await
-                    .remove(&req_hdr.session_id);
-            }
-        }
-
-        Some(bytes)
-    })
-    .instrument(span)
-    .await
+    Some(bytes)
 }
 
 /// Stable, `'static` command name for `TraceEvent::Request` — never the
@@ -635,8 +1021,12 @@ async fn verify_request_signature(
 
 /// Build the final on-the-wire bytes: header + body, with signing applied
 /// when the session has a key.
-async fn build_response_bytes(
-    conn: &Arc<Connection>,
+///
+/// Synchronous on purpose: it reads the connection's signing snapshot, never
+/// a lock a stuck handler can hold, so a timeout or panic response can always
+/// be built.
+fn build_response_bytes(
+    conn: &Connection,
     req_hdr: &Smb2Header,
     handler_resp: HandlerResponse,
 ) -> Vec<u8> {
@@ -662,22 +1052,18 @@ async fn build_response_bytes(
         req_hdr.command == Command::SessionSetup && handler_resp.status == ntstatus::STATUS_SUCCESS;
     let mut should_sign = false;
     let mut key = [0u8; 16];
-    let algo = *conn.signing_algo.read().await;
+    let (algo, session) = conn.signing_context(hdr.session_id);
     if !handler_resp.skip_signing
         && hdr.session_id != 0
         && (request_was_signed || is_session_setup_success)
+        && let Some(session) = session
     {
-        let sessions = conn.sessions.read().await;
-        if let Some(sess_arc) = sessions.get(&hdr.session_id) {
-            let sess = sess_arc.read().await;
-            let is_anon = matches!(sess.identity, Identity::Anonymous);
-            let is_guest_response = is_session_setup_success
-                && handler_resp.body.len() >= 4
-                && (handler_resp.body[2] & 0x01) != 0;
-            if !is_anon && !is_guest_response && sess.signing_key != [0u8; 16] {
-                key = sess.signing_key;
-                should_sign = true;
-            }
+        let is_guest_response = is_session_setup_success
+            && handler_resp.body.len() >= 4
+            && (handler_resp.body[2] & 0x01) != 0;
+        if !session.anonymous && !is_guest_response && session.key != [0u8; 16] {
+            key = session.key;
+            should_sign = true;
         }
     }
     if should_sign {
@@ -773,7 +1159,7 @@ async fn handle_smb1_multi_protocol(
         ..Default::default()
     };
     let resp = handlers::negotiate::multi_protocol_response(server, conn, chosen).await;
-    Some(build_response_bytes(conn, &req_hdr, resp).await)
+    Some(build_response_bytes(conn, &req_hdr, resp))
 }
 
 #[cfg(test)]
@@ -912,7 +1298,7 @@ mod tests {
 
         let resp = dispatch_frame(&server, &conn, &frame).await;
         assert!(
-            resp.is_some(),
+            matches!(resp, FrameOutcome::Response(_)),
             "a 3-op ECHO compound must produce a response"
         );
 

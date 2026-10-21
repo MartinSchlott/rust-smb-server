@@ -24,12 +24,15 @@ mod error;
 #[cfg(feature = "localfs")]
 mod fs;
 mod handlers;
+mod incident;
 pub(crate) mod info_class;
 pub mod ntstatus;
 mod path;
 mod proto;
+mod pulse;
 pub(crate) mod reparse;
 mod server;
+mod supervise;
 pub mod trace;
 mod utils;
 
@@ -41,6 +44,7 @@ pub use builder::{Access, Share};
 pub use error::{SmbError, SmbResult};
 #[cfg(feature = "localfs")]
 pub use fs::LocalFsBackend;
+pub use incident::{Incident, IncidentKind, IncidentSink};
 pub use path::SmbPath;
 pub use proto::auth::ntlm::Identity;
 pub use server::{ConfigHandle, ShareMode, ShutdownHandle, SmbServer};

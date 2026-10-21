@@ -28,7 +28,7 @@ pub async fn connection_loop(stream: TcpStream, server: Arc<ServerState>) -> io:
     server.active_connections.insert(conn_id, &conn).await;
     let (tx, rx) = mpsc::channel::<writer::FramePayload>(writer::WRITER_CHANNEL);
 
-    let writer_handle = tokio::spawn(writer::writer_task(write_half, rx));
+    let writer_handle = tokio::spawn(writer::writer_task(write_half, rx, conn.subscribe_close()));
 
     info!("connection accepted");
     let reader_result = reader::reader_task(read_half, server.clone(), conn.clone(), tx).await;

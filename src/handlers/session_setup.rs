@@ -211,6 +211,11 @@ pub async fn handle(
     {
         let mut sessions = conn.sessions.write().await;
         sessions.insert(sid, session_arc);
+        conn.snapshot_session(
+            sid,
+            signing_key,
+            matches!(outcome.identity, Identity::Anonymous),
+        );
     }
 
     // Empty buffer for raw NTLMSSP path; SPNEGO accept-completed for SPNEGO.

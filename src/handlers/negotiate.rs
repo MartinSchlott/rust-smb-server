@@ -61,10 +61,15 @@ pub async fn handle(
     };
     *conn.dialect.write().await = Some(dialect);
     *conn.client_guid.write().await = Uuid::from_bytes(req.client_guid);
-    *conn.signing_algo.write().await = match dialect {
-        Dialect::Smb202 | Dialect::Smb210 => SigningAlgo::HmacSha256,
-        _ => SigningAlgo::AesCmac,
-    };
+    {
+        let algo = match dialect {
+            Dialect::Smb202 | Dialect::Smb210 => SigningAlgo::HmacSha256,
+            _ => SigningAlgo::AesCmac,
+        };
+        let mut guard = conn.signing_algo.write().await;
+        *guard = algo;
+        conn.set_signing_algo(algo);
+    }
 
     // Build SPNEGO security blob (mech-list-only, advertising NTLMSSP).
     let security_blob = encode_init_response();

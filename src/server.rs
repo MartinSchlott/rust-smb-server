@@ -6,6 +6,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use crate::proto::auth::ntlm::UserCreds;
 use thiserror::Error;
@@ -212,7 +213,25 @@ pub struct ServerState {
     /// `None` unless `SmbServer::builder().trace_sink(...)` was called
     /// (`docs/PLAN_smb_round_two.md` Step 1a).
     pub trace_sink: crate::trace::SinkHandle,
+    /// Receiver of dispatch incidents; `None` falls back to `tracing`.
+    pub incident_sink: crate::incident::IncidentSinkHandle,
+    /// Deadline of one frame, measured from its admission.
+    pub dispatch_deadline: Duration,
+    /// How long a handler may run before a `Slow` incident is reported.
+    pub slow_dispatch_threshold: Duration,
+    /// How long a cancelled handler may take to stop before the connection is
+    /// closed instead.
+    pub cancellation_grace: Duration,
+    /// Keeps the runtime's timers alive while a handler blocks a worker.
+    pub(crate) pulse: crate::pulse::Pulse,
 }
+
+/// Default frame deadline (`SmbServerBuilder::dispatch_deadline`).
+pub const DEFAULT_DISPATCH_DEADLINE: Duration = Duration::from_secs(60);
+/// Default slow threshold (`SmbServerBuilder::slow_dispatch_threshold`).
+pub const DEFAULT_SLOW_DISPATCH_THRESHOLD: Duration = Duration::from_secs(5);
+/// Default cancellation grace (`SmbServerBuilder::cancellation_grace`).
+pub const DEFAULT_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
 
 impl ServerState {
     pub fn new(config: ServerConfig, users: ServerUsers, shares: Vec<Arc<ShareBindings>>) -> Self {
@@ -225,6 +244,11 @@ impl ServerState {
             shutdown: Arc::new(Notify::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
             trace_sink: None,
+            incident_sink: None,
+            dispatch_deadline: DEFAULT_DISPATCH_DEADLINE,
+            slow_dispatch_threshold: DEFAULT_SLOW_DISPATCH_THRESHOLD,
+            cancellation_grace: DEFAULT_CANCELLATION_GRACE,
+            pulse: crate::pulse::Pulse::new(),
         }
     }
 
