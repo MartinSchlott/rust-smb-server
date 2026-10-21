@@ -735,10 +735,15 @@ fn stitch_responses(conn: &Arc<Connection>, responses: Vec<Vec<u8>>) -> Vec<u8> 
             response[0x14..0x18].copy_from_slice(&(next as u32).to_le_bytes());
         }
         out.extend_from_slice(&response);
-        ranges.push((start, actual_len));
 
+        // MS-SMB2 §3.1.4.1: the signature of a compound element covers the
+        // whole span up to the next element, alignment padding included.
         if index + 1 < response_count {
-            out.resize(start + align_8(actual_len), 0);
+            let padded = align_8(actual_len);
+            out.resize(start + padded, 0);
+            ranges.push((start, padded));
+        } else {
+            ranges.push((start, actual_len));
         }
     }
 

@@ -1425,16 +1425,12 @@ mod tests {
             read_u32(entry, 0x24)
         }
 
-        /// Whether the entry carries a valid signature. The padding after the
-        /// signed bytes is unknown to the caller, so each possible length is
-        /// tried.
+        /// Whether the entry carries a valid signature over exactly its wire
+        /// span: for a non-final compound element that includes the alignment
+        /// padding up to the next element (MS-SMB2 §3.1.4.1).
         fn signature_valid(entry: &[u8]) -> bool {
-            if read_u32(entry, 0x10) & SMB2_FLAGS_SIGNED == 0 {
-                return false;
-            }
-            (entry.len().saturating_sub(7)..=entry.len())
-                .filter(|len| *len >= SMB2_HEADER_LEN)
-                .any(|len| verify(&entry[..len], &SIGNING_KEY, SigningAlgo::HmacSha256).is_ok())
+            read_u32(entry, 0x10) & SMB2_FLAGS_SIGNED != 0
+                && verify(entry, &SIGNING_KEY, SigningAlgo::HmacSha256).is_ok()
         }
 
         // ── panic and deadline ───────────────────────────────────────────
