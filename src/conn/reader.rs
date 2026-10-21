@@ -138,12 +138,14 @@ async fn run_frame(
 /// no handler touches connection state afterwards — including a handler that
 /// was abandoned and could not be cancelled.
 pub async fn reader_task(
-    mut reader: ReadHalf<TcpStream>,
+    reader: ReadHalf<TcpStream>,
     server: Arc<ServerState>,
     conn: Arc<Connection>,
     tx: tokio::sync::mpsc::Sender<FramePayload>,
 ) -> io::Result<()> {
     let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
+    // Released early on a close, see the serialized path below.
+    let mut reader = Some(reader);
 
     let result = loop {
         // Race the frame read against writer closure so a dead writer is
@@ -158,7 +160,7 @@ pub async fn reader_task(
                 debug!("writer channel closed; reader stopping admission");
                 break Ok(());
             }
-            frame = read_one_frame(&mut reader) => {
+            frame = read_one_frame(reader.as_mut().expect("the read half is held until the loop ends")) => {
                 match frame {
                     Ok(Some(b)) => b,
                     Ok(None) => {
@@ -204,8 +206,26 @@ pub async fn reader_task(
                     permits.expect("inflight semaphore is never closed")
                 }
             };
-            if let FrameResult::Stop = run_frame(&server, &conn, &tx, &frame).await {
-                break Ok(());
+            let frame_run = run_frame(&server, &conn, &tx, &frame);
+            tokio::pin!(frame_run);
+            let finished = tokio::select! {
+                biased;
+                result = &mut frame_run => Some(result),
+                // The writer ended while this frame is still running: a close
+                // (`Connection::close`), the very case in which the frame may
+                // be a handler that cannot be cancelled. Release the read half
+                // now so the socket closes completely, and keep awaiting the
+                // frame so the task still returns only after it has ended.
+                _ = tx.closed() => None,
+            };
+            match finished {
+                Some(FrameResult::Continue) => {}
+                Some(FrameResult::Stop) => break Ok(()),
+                None => {
+                    drop(reader.take());
+                    let _ = frame_run.await;
+                    break Ok(());
+                }
             }
         } else {
             // Backpressure point: admission for a data-path frame waits for
@@ -1117,6 +1137,9 @@ mod tests {
             /// `close` panics, which a TREE_DISCONNECT (a serialized frame)
             /// reaches through the tree teardown.
             PanicOnClose,
+            /// `close` blocks the worker thread without yielding: a
+            /// TREE_DISCONNECT (a serialized frame) that cannot be cancelled.
+            SyncBlockOnClose(Duration),
         }
 
         struct FaultHandle {
@@ -1147,7 +1170,9 @@ mod tests {
                         std::thread::sleep(*duration);
                         Ok(Bytes::from_static(b"0123456789abcdef"))
                     }
-                    Fault::PanicOnClose => Ok(Bytes::from_static(b"0123456789abcdef")),
+                    Fault::PanicOnClose | Fault::SyncBlockOnClose(_) => {
+                        Ok(Bytes::from_static(b"0123456789abcdef"))
+                    }
                 }
             }
             async fn write(&self, _offset: u64, data: &[u8]) -> SmbResult<u32> {
@@ -1180,8 +1205,10 @@ mod tests {
                 Ok(vec![])
             }
             async fn close(self: Box<Self>) -> SmbResult<()> {
-                if matches!(self.fault, Fault::PanicOnClose) {
-                    panic!("close exploded");
+                match self.fault {
+                    Fault::PanicOnClose => panic!("close exploded"),
+                    Fault::SyncBlockOnClose(duration) => std::thread::sleep(duration),
+                    _ => {}
                 }
                 Ok(())
             }
@@ -1624,6 +1651,69 @@ mod tests {
             let result = tokio::time::timeout(Duration::from_secs(5), &mut wire.reader)
                 .await
                 .expect("reader_task returns once the sleep ends")
+                .expect("join");
+            assert!(result.is_ok());
+            assert!(started.elapsed() >= block - Duration::from_millis(50));
+            assert!(
+                !incidents.of_kind(is_closed).is_empty(),
+                "a ConnectionClosed incident"
+            );
+        }
+
+        /// The serialized counterpart of the non-yielding close: the reader is
+        /// awaiting a frame that cannot be cancelled (a TREE_DISCONNECT whose
+        /// handler blocks a worker thread), not parked at its read. The close
+        /// must still release the read half, so a client write is reset, and
+        /// `reader_task` must still return only after the handler ends.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn serialized_non_yielding_handler_closes_and_releases_the_read_half() {
+            let (server, incidents) = short_server();
+            let block = DEADLINE + GRACE + Duration::from_secs(1);
+            let (handle, _entered) = fault_handle(Fault::SyncBlockOnClose(block));
+            let (conn, session_id, tree_id, _files) =
+                seeded_connection(&server, vec![handle]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            let started = std::time::Instant::now();
+            let td = header(Command::TreeDisconnect, 91, session_id, tree_id);
+            wire.send(&tree_disconnect_payload(&td)).await;
+
+            match wire.recv(block - Duration::from_millis(100)).await {
+                Recv::Eof => {}
+                Recv::Frame(_) => panic!("a response arrived instead of the close"),
+                Recv::Silent => panic!(
+                    "the connection was not closed after deadline + grace; incidents: {:?}",
+                    incidents.all()
+                ),
+            }
+            let closed_after = started.elapsed();
+            assert!(
+                closed_after >= DEADLINE + GRACE - Duration::from_millis(50)
+                    && closed_after < DEADLINE + GRACE + Duration::from_millis(500),
+                "closed after {closed_after:?}, expected shortly after deadline + grace \
+                 (the handler sleeps for {block:?})"
+            );
+            assert!(
+                !wire.reader.is_finished(),
+                "reader_task must not return while the abandoned handler still runs"
+            );
+            let mut write_failed = false;
+            for _ in 0..20 {
+                if wire.client.write_all(&[0u8; 64]).await.is_err() {
+                    write_failed = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                write_failed,
+                "a client write after the close must be reset: the reader, awaiting the \
+                 serialized frame, must have released its read half"
+            );
+
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut wire.reader)
+                .await
+                .expect("reader_task returns once the handler ends")
                 .expect("join");
             assert!(result.is_ok());
             assert!(started.elapsed() >= block - Duration::from_millis(50));
