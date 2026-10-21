@@ -383,6 +383,8 @@ pub async fn dispatch_frame(
         };
 
         let response = match deadline {
+            // An unexecuted CANCEL stays unanswered, as the protocol requires.
+            None if req_hdr.command == Command::Cancel => None,
             None => {
                 let status = sub.inherited_failure.unwrap_or(ntstatus::STATUS_IO_TIMEOUT);
                 Some(error_response(server, conn, &sub, status))
@@ -407,6 +409,7 @@ pub async fn dispatch_frame(
                     ))
                 }
                 Supervised::Abandoned => return FrameOutcome::NoResponse,
+                Supervised::Refused if req_hdr.command == Command::Cancel => None,
                 Supervised::Refused => Some(error_response(
                     server,
                     conn,

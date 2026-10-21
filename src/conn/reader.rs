@@ -2005,6 +2005,49 @@ mod tests {
                 .await;
         }
 
+        /// A CANCEL is never answered, not even when it is the request that
+        /// is refused: it takes the injected start failure silently, and the
+        /// next request is the one that is answered.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_refused_cancel_stays_unanswered() {
+            let (state, incidents) = supervised_server(DEADLINE, SLOW, GRACE);
+            state.pulse.inject_start_failures(1);
+            let server = Arc::new(state);
+            let (conn, session_id, tree_id, _files) = seeded_connection(&server, vec![]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            // One compound frame, so the CANCEL is deterministically the
+            // sub-request that meets the failed start.
+            let frame = compound(
+                vec![
+                    (
+                        header(Command::Cancel, 21, session_id, tree_id),
+                        vec![0u8; 4],
+                    ),
+                    (header(Command::Echo, 22, session_id, tree_id), echo_body()),
+                ],
+                None,
+            );
+            wire.send(&frame).await;
+
+            let response = wire
+                .recv(Duration::from_secs(3))
+                .await
+                .frame("the ECHO after the refused CANCEL");
+            assert_eq!(
+                header_command(&response),
+                Command::Echo as u16,
+                "the response must be the ECHO's alone, not the CANCEL's"
+            );
+            assert_eq!(status_of(&response), STATUS_SUCCESS);
+            assert_eq!(
+                response_entries(&response).len(),
+                1,
+                "the CANCEL contributes no entry"
+            );
+            assert_eq!(incidents.of_kind(is_unavailable).len(), 1);
+        }
+
         // ── load and barrier frames ──────────────────────────────────────
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
