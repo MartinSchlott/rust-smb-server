@@ -391,6 +391,9 @@ pub async fn dispatch_frame(
             }
             Some(deadline) => match run_supervised(server, conn, &sub, deadline).await {
                 Supervised::Completed(handled) => complete(server, conn, &sub, handled).await,
+                // A CANCEL never gets a generic error response, whatever
+                // happened to its handling: the protocol leaves it unanswered.
+                Supervised::Panicked if req_hdr.command == Command::Cancel => None,
                 Supervised::Panicked => Some(error_response(
                     server,
                     conn,
@@ -401,12 +404,16 @@ pub async fn dispatch_frame(
                     if cleanup_cutoff.is_none() {
                         cleanup_cutoff = Some(Instant::now() + server.cancellation_grace);
                     }
-                    Some(error_response(
-                        server,
-                        conn,
-                        &sub,
-                        ntstatus::STATUS_IO_TIMEOUT,
-                    ))
+                    if req_hdr.command == Command::Cancel {
+                        None
+                    } else {
+                        Some(error_response(
+                            server,
+                            conn,
+                            &sub,
+                            ntstatus::STATUS_IO_TIMEOUT,
+                        ))
+                    }
                 }
                 Supervised::Abandoned => return FrameOutcome::NoResponse,
                 Supervised::Refused if req_hdr.command == Command::Cancel => None,

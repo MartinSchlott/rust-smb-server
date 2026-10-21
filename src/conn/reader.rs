@@ -236,6 +236,12 @@ pub async fn reader_task(
         }
     };
 
+    // Stop reading before waiting for the dispatches: once the writer has shut
+    // its half down (a close, or a finished connection) the socket then closes
+    // completely, instead of staying half-open — accepting and never reading
+    // the client's writes — for as long as a stuck handler keeps its permit.
+    drop(reader);
+
     // On every exit path: acquire every permit before returning, so no
     // dispatch spawned above is still touching connection state after
     // `reader_task` returns.
@@ -1049,18 +1055,18 @@ mod tests {
             )
         }
 
-        /// Records, at the moment a TREE_DISCONNECT enters dispatch, whether a
+        /// Records, at the moment a TREE_CONNECT enters dispatch, whether a
         /// flag is already set — proof that something finished *before* the
-        /// serialization barrier let the TREE_DISCONNECT run.
-        struct FlagAtTreeDisconnect {
+        /// serialization barrier let the TREE_CONNECT run.
+        struct FlagAtTreeConnect {
             flag: Arc<AtomicBool>,
             seen: StdMutex<Option<bool>>,
         }
 
-        impl TraceSink for FlagAtTreeDisconnect {
+        impl TraceSink for FlagAtTreeConnect {
             fn record(&self, _key: Option<TraceKey>, event: &TraceEvent) {
                 if let TraceEvent::Request { cmd, .. } = event
-                    && *cmd == "TreeDisconnect"
+                    && *cmd == "TreeConnect"
                 {
                     *self.seen.lock().unwrap() = Some(self.flag.load(Ordering::SeqCst));
                 }
@@ -1330,20 +1336,51 @@ mod tests {
                 }
             }
 
-            /// A TREE_DISCONNECT is a barrier frame: it is answered, with any
-            /// status, only if the connection is alive and unstalled.
-            async fn assert_barrier_answered(&mut self, message_id: u64, ids: (u64, u32)) {
-                let hdr = header(Command::TreeDisconnect, message_id, ids.0, ids.1);
-                self.send(&tree_disconnect_payload(&hdr)).await;
+            /// Sends the TREE_CONNECT barrier frame (a serialized frame, so the
+            /// reader parks it at `acquire_many` behind anything in flight).
+            async fn send_barrier(&mut self, message_id: u64, session_id: u64) {
+                let hdr = header(Command::TreeConnect, message_id, session_id, 0);
+                self.send(&tree_connect_payload(&hdr)).await;
+            }
+
+            /// The answer to a barrier sent earlier: any status will do.
+            async fn expect_barrier_answer(&mut self) {
                 let response = self
                     .recv(Duration::from_secs(5))
                     .await
-                    .frame("the barrier frame after the fault");
-                assert_eq!(header_command(&response), Command::TreeDisconnect as u16);
+                    .frame("the TREE_CONNECT barrier after the fault");
+                assert_eq!(header_command(&response), Command::TreeConnect as u16);
+            }
+
+            /// Sends a TREE_CONNECT and awaits its answer.
+            async fn assert_barrier_answered(&mut self, message_id: u64, ids: (u64, u32)) {
+                self.send_barrier(message_id, ids.0).await;
+                self.expect_barrier_answer().await;
             }
         }
 
         // ── frame builders ───────────────────────────────────────────────
+
+        /// A TREE_CONNECT to a share that does not exist: a serialized (barrier)
+        /// frame; whatever status it gets, an answer proves the connection is
+        /// alive and was not left waiting behind a stuck request.
+        fn tree_connect_payload(hdr: &Smb2Header) -> Vec<u8> {
+            let path: Vec<u8> = "\\\\server\\nosuchshare"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            let req = crate::proto::messages::TreeConnectRequest {
+                structure_size: 9,
+                flags: 0,
+                path_offset: 0x48,
+                path_length: path.len() as u16,
+                path,
+            };
+            let mut body = Vec::new();
+            req.write_to(&mut body)
+                .expect("encode tree connect request");
+            frame_payload(hdr, &body)
+        }
 
         fn body_of(payload: &[u8]) -> Vec<u8> {
             payload[SMB2_HEADER_LEN..].to_vec()
@@ -1445,6 +1482,7 @@ mod tests {
 
             let hdr = header(Command::Read, 41, session_id, tree_id);
             wire.send(&read_request_payload(&hdr, file_ids[0])).await;
+            wire.send_barrier(42, session_id).await;
 
             let started = std::time::Instant::now();
             let response = wire
@@ -1455,8 +1493,7 @@ mod tests {
             assert_eq!(header_command(&response), Command::Read as u16);
             assert_eq!(status_of(&response), STATUS_INTERNAL_ERROR);
 
-            wire.assert_barrier_answered(42, (session_id, tree_id))
-                .await;
+            wire.expect_barrier_answer().await;
 
             let panicked = incidents.of_kind(is_panicked);
             assert_eq!(panicked.len(), 1, "exactly one Panicked incident");
@@ -1475,7 +1512,7 @@ mod tests {
             let (fault, dropped) = never_fault();
             let (handle, _entered) = fault_handle(fault);
             let (mut state, incidents) = supervised_server(DEADLINE, SLOW, GRACE);
-            let flag_sink = Arc::new(FlagAtTreeDisconnect {
+            let flag_sink = Arc::new(FlagAtTreeConnect {
                 flag: dropped.clone(),
                 seen: StdMutex::new(None),
             });
@@ -1487,6 +1524,9 @@ mod tests {
 
             let hdr = header(Command::Read, 51, session_id, tree_id);
             wire.send(&read_request_payload(&hdr, file_ids[0])).await;
+            // Behind the stuck READ, before its timeout response: the reader
+            // parks this frame at the serialization barrier.
+            wire.send_barrier(52, session_id).await;
 
             let started = std::time::Instant::now();
             let response = wire
@@ -1504,12 +1544,11 @@ mod tests {
                 "answered later than deadline + grace: {elapsed:?}"
             );
 
-            wire.assert_barrier_answered(52, (session_id, tree_id))
-                .await;
+            wire.expect_barrier_answer().await;
             assert_eq!(
                 *flag_sink.seen.lock().unwrap(),
                 Some(true),
-                "the abandoned handler's future must be dropped before the TREE_DISCONNECT runs"
+                "the abandoned handler's future must be dropped before the TREE_CONNECT is dispatched"
             );
 
             let slow = incidents.of_kind(is_slow);
@@ -1534,8 +1573,7 @@ mod tests {
             let hdr = header(Command::Read, 61, session_id, tree_id);
             wire.send(&read_request_payload(&hdr, file_ids[0])).await;
             assert!(recv_within(&mut entered, Duration::from_secs(5)).await);
-            let td = header(Command::TreeDisconnect, 62, session_id, tree_id);
-            wire.send(&tree_disconnect_payload(&td)).await;
+            wire.send_barrier(62, session_id).await;
 
             match wire.recv(block - Duration::from_millis(100)).await {
                 Recv::Eof => {}
@@ -1562,6 +1600,25 @@ mod tests {
             assert!(
                 !wire.reader.is_finished(),
                 "reader_task must not return while the abandoned handler still runs"
+            );
+            // The socket is closed completely, not left half-open: a client
+            // write after the FIN meets a reset instead of being accepted and
+            // never read while the stuck handler keeps the reader waiting.
+            let mut write_failed = false;
+            for _ in 0..20 {
+                if wire.client.write_all(&[0u8; 64]).await.is_err() {
+                    write_failed = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                write_failed,
+                "a client write after the close must be reset, not silently accepted"
+            );
+            assert!(
+                !wire.reader.is_finished(),
+                "the handler is still running; the reader has not returned"
             );
 
             let result = tokio::time::timeout(Duration::from_secs(5), &mut wire.reader)
@@ -1637,6 +1694,56 @@ mod tests {
             drop(session_guard);
             drop(sessions_guard);
             wire.assert_barrier_answered(72, (session_id, tree_id))
+                .await;
+        }
+
+        /// A CANCEL whose handling is stuck past the deadline (its signature
+        /// check waits on session state a stuck operation holds) is cancelled
+        /// and reported, but never answered with the timeout status: the
+        /// protocol leaves CANCEL without a response.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_cancel_that_times_out_stays_unanswered() {
+            let (server, incidents) = short_server();
+            let backend = HandleBackend {
+                make: Box::new(|| unreachable!("no CREATE in this test")),
+            };
+            let (conn, session_id, tree_id) = signed_connection_over(backend).await;
+            let mut wire = spawn_wire(server, conn.clone()).await;
+
+            let sessions_guard = conn.sessions.write().await;
+            let cancel = header(Command::Cancel, 71, session_id, tree_id);
+            wire.send(&frame_payload(&cancel, &[0u8; 4])).await;
+            match wire
+                .recv(DEADLINE + GRACE + Duration::from_millis(300))
+                .await
+            {
+                Recv::Silent => {}
+                Recv::Frame(frame) => panic!(
+                    "the timed-out CANCEL was answered with status {:#x}",
+                    status_of(&frame)
+                ),
+                Recv::Eof => panic!("the connection closed"),
+            }
+            drop(sessions_guard);
+
+            let echo = header(Command::Echo, 72, session_id, tree_id);
+            wire.send(&echo_payload(&echo)).await;
+            let response = wire
+                .recv(Duration::from_secs(3))
+                .await
+                .frame("the ECHO after the timed-out CANCEL");
+            assert_eq!(
+                header_command(&response),
+                Command::Echo as u16,
+                "the only response belongs to the ECHO"
+            );
+            assert_eq!(status_of(&response), STATUS_SUCCESS);
+
+            let timed_out = incidents.of_kind(is_timed_out);
+            assert_eq!(timed_out.len(), 1, "the CANCEL's timeout is still reported");
+            assert_eq!(timed_out[0].command, Some("Cancel"));
+            assert_eq!(timed_out[0].message_id, Some(71));
+            wire.assert_barrier_answered(73, (session_id, tree_id))
                 .await;
         }
 
@@ -1875,8 +1982,7 @@ mod tests {
             garbled[12] = 0xFF;
             garbled[13] = 0xFF;
             wire.send(&garbled).await;
-            let td = header(Command::TreeDisconnect, 2, session_id, tree_id);
-            wire.send(&tree_disconnect_payload(&td)).await;
+            wire.send_barrier(2, session_id).await;
 
             expect_closed_without_response(&mut wire, "a header that does not parse").await;
             let malformed = incidents.of_kind(is_malformed);
