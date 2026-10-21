@@ -1960,27 +1960,40 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn a_failed_pulse_start_refuses_that_request_and_keeps_the_connection() {
             let (state, incidents) = supervised_server(DEADLINE, SLOW, GRACE);
-            // The first start fails; the retry on the next request succeeds.
+            // Exactly one start fails, through the test seam; the retry on the
+            // next request succeeds.
             state.pulse.inject_start_failures(1);
             let server = Arc::new(state);
-            let (conn, session_id, tree_id, _files) = seeded_connection(&server, vec![]).await;
+            let release = Arc::new(Notify::new());
+            let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+            let (conn, session_id, tree_id, file_ids) =
+                seeded_connection(&server, vec![blocking_handle(release.clone(), entered_tx)])
+                    .await;
+            let connection_id = conn.connection_id;
             let mut wire = spawn_wire(server, conn).await;
 
-            let first = header(Command::Echo, 11, session_id, tree_id);
-            wire.send(&echo_payload(&first)).await;
+            // A READ whose handler would signal on entry: refused, never run.
+            let first = header(Command::Read, 11, session_id, tree_id);
+            wire.send(&read_request_payload(&first, file_ids[0])).await;
             let response = wire
                 .recv(Duration::from_secs(3))
                 .await
                 .frame("the refused request must still be answered");
-            assert_eq!(header_command(&response), Command::Echo as u16);
+            assert_eq!(header_command(&response), Command::Read as u16);
             assert_eq!(status_of(&response), STATUS_INSUFFICIENT_RESOURCES);
+            assert!(
+                entered_rx.try_recv().is_err(),
+                "the refused request's handler must never run"
+            );
 
+            // The same connection retries the start and answers normally.
             let second = header(Command::Echo, 12, session_id, tree_id);
             wire.send(&echo_payload(&second)).await;
             let response = wire
                 .recv(Duration::from_secs(3))
                 .await
                 .frame("the connection must stay usable and retry the start");
+            assert_eq!(header_command(&response), Command::Echo as u16);
             assert_eq!(status_of(&response), STATUS_SUCCESS);
 
             let unavailable = incidents.of_kind(is_unavailable);
@@ -1994,9 +2007,12 @@ mod tests {
                 IncidentKind::SupervisionUnavailable { reason }
                     if reason.contains("injected pulse start failure")
             ));
-            assert_eq!(unavailable[0].command, Some("Echo"));
-            assert_eq!(unavailable[0].message_id, Some(11));
-            assert_eq!(unavailable[0].compound_ordinal, Some(0));
+            assert_eq!(
+                identity(&unavailable[0]),
+                (connection_id, Some(11), Some(0))
+            );
+            assert_eq!(unavailable[0].command, Some("Read"));
+            assert_eq!(unavailable[0].path.as_deref(), Some("block.txt"));
             assert!(
                 incidents.of_kind(is_closed).is_empty(),
                 "the connection was not closed"
@@ -2046,6 +2062,49 @@ mod tests {
                 "the CANCEL contributes no entry"
             );
             assert_eq!(incidents.of_kind(is_unavailable).len(), 1);
+        }
+
+        /// Once the frame's budget is spent, the rest of the chain is answered
+        /// unexecuted — but a CANCEL never gets the timeout response.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_cancel_after_the_budget_is_spent_stays_unanswered() {
+            let (server, _incidents) = short_server();
+            let (fault, _dropped) = never_fault();
+            let (handle, _entered) = fault_handle(fault);
+            let (conn, session_id, tree_id, file_ids) =
+                seeded_connection(&server, vec![handle]).await;
+            let mut wire = spawn_wire(server, conn).await;
+
+            let frame = compound(
+                vec![
+                    (
+                        header(Command::Read, 31, session_id, tree_id),
+                        read_body(file_ids[0]),
+                    ),
+                    (
+                        header(Command::Cancel, 32, session_id, tree_id),
+                        vec![0u8; 4],
+                    ),
+                    (header(Command::Echo, 33, session_id, tree_id), echo_body()),
+                ],
+                None,
+            );
+            wire.send(&frame).await;
+            let response = wire
+                .recv(DEADLINE + 3 * GRACE + Duration::from_secs(1))
+                .await
+                .frame("the compound response");
+            let entries = response_entries(&response);
+            let statuses: Vec<u32> = entries.iter().map(|e| status_of(e)).collect();
+            assert_eq!(
+                statuses,
+                vec![STATUS_IO_TIMEOUT, STATUS_IO_TIMEOUT],
+                "READ and ECHO are answered; the CANCEL contributes no entry"
+            );
+            let commands: Vec<u16> = entries.iter().map(|e| header_command(e)).collect();
+            assert_eq!(commands, vec![Command::Read as u16, Command::Echo as u16]);
+            wire.assert_barrier_answered(34, (session_id, tree_id))
+                .await;
         }
 
         // ── load and barrier frames ──────────────────────────────────────
