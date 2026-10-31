@@ -1356,7 +1356,13 @@ impl Handle for TestHandle {
     }
 }
 
-async fn install_open(tree: &TreeConnect, path: &str, mode: CloseMode) -> Arc<LockOwner> {
+async fn install_open(
+    conn: &Connection,
+    session_id: u64,
+    tree: &TreeConnect,
+    path: &str,
+    mode: CloseMode,
+) -> Arc<LockOwner> {
     let file_id = tree.alloc_file_id();
     let open = Open::new(
         file_id,
@@ -1367,6 +1373,7 @@ async fn install_open(tree: &TreeConnect, path: &str, mode: CloseMode) -> Arc<Lo
         false,
     );
     let owner = open.lock_owner.clone();
+    conn.register_open_owner(session_id, tree.id, tree.share.clone(), owner.clone());
     tree.opens
         .write()
         .await
@@ -1402,12 +1409,12 @@ async fn session_with_failing_closes(
     };
 
     // Tree 1: "a" held, "b" waiting.
-    let a = install_open(&tree1, "a", modes()).await;
+    let a = install_open(conn.as_ref(), 1, &tree1, "a", modes()).await;
     share
         .locks
         .try_lock("a", &a, &[Range::new(0, 10, true).unwrap()])
         .unwrap();
-    let b = install_open(&tree1, "b", modes()).await;
+    let b = install_open(conn.as_ref(), 1, &tree1, "b", modes()).await;
     let (done_b, wait_b) = tokio::sync::oneshot::channel();
     conn.register_pending(
         1,
@@ -1421,12 +1428,12 @@ async fn session_with_failing_closes(
     .map_err(|_| ())
     .expect("registered");
     // Tree 2: "c" held, "d" waiting.
-    let c = install_open(&tree2, "c", modes()).await;
+    let c = install_open(conn.as_ref(), 1, &tree2, "c", modes()).await;
     share
         .locks
         .try_lock("c", &c, &[Range::new(0, 10, true).unwrap()])
         .unwrap();
-    let d = install_open(&tree2, "d", modes()).await;
+    let d = install_open(conn.as_ref(), 1, &tree2, "d", modes()).await;
     let (done_d, wait_d) = tokio::sync::oneshot::channel();
     conn.register_pending(
         2,
@@ -1523,4 +1530,188 @@ async fn a_stalled_backend_close_cancelled_before_it_finishes_releases_every_tre
             "a fresh connection can acquire {path}"
         );
     }
+}
+
+// ── cancellation during the drain phase ────────────────────────────────────
+
+struct DrainRig {
+    conn: Arc<Connection>,
+    share: Arc<ShareBindings>,
+    tree: Arc<RwLock<TreeConnect>>,
+    /// The locked open, kept so a test can hold its read guard across the
+    /// close and force the drain to wait.
+    open: Arc<RwLock<Open>>,
+    waiter: tokio::sync::oneshot::Receiver<u32>,
+    close_started: mpsc::UnboundedReceiver<()>,
+}
+
+async fn drain_rig() -> DrainRig {
+    let share = make_share(Arc::new(MemFsBackend::new()));
+    let conn = Arc::new(Connection::new(1, Uuid::nil(), 1 << 20, 1 << 20));
+    let session = Arc::new(RwLock::new(Session::new(
+        1,
+        Identity::Anonymous,
+        [0; 16],
+        [0; 16],
+        false,
+        None,
+    )));
+    let tree = TreeConnect::new(1, share.clone(), Access::ReadWrite);
+    let (started_tx, close_started) = mpsc::unbounded_channel();
+
+    // "a" is locked and its read guard is the one a test retains.
+    let a_fid = tree.alloc_file_id();
+    let a_open = Open::new(
+        a_fid,
+        Box::new(TestHandle {
+            mode: CloseMode::Stall(started_tx.clone()),
+        }),
+        Access::ReadWrite,
+        "a".parse().expect("path"),
+        false,
+        false,
+    );
+    let a_owner = a_open.lock_owner.clone();
+    conn.register_open_owner(1, tree.id, share.clone(), a_owner.clone());
+    let a_open = Arc::new(RwLock::new(a_open));
+    tree.opens.write().await.insert(a_fid, a_open.clone());
+    share
+        .locks
+        .try_lock("a", &a_owner, &[Range::new(0, 10, true).unwrap()])
+        .unwrap();
+
+    // "b" waits, so its pending request must complete as well.
+    let b_fid = tree.alloc_file_id();
+    let b_open = Open::new(
+        b_fid,
+        Box::new(TestHandle {
+            mode: CloseMode::Stall(started_tx),
+        }),
+        Access::ReadWrite,
+        "b".parse().expect("path"),
+        false,
+        false,
+    );
+    let b_owner = b_open.lock_owner.clone();
+    conn.register_open_owner(1, tree.id, share.clone(), b_owner.clone());
+    tree.opens
+        .write()
+        .await
+        .insert(b_fid, Arc::new(RwLock::new(b_open)));
+    let (done, waiter) = tokio::sync::oneshot::channel();
+    conn.register_pending(
+        1,
+        Pending {
+            message_id: 1,
+            owner: b_owner,
+            on_close: ntstatus::STATUS_RANGE_NOT_LOCKED,
+            done,
+        },
+    )
+    .map_err(|_| ())
+    .expect("registered");
+
+    let tree = Arc::new(RwLock::new(tree));
+    session
+        .read()
+        .await
+        .trees
+        .write()
+        .await
+        .insert(1, tree.clone());
+    conn.sessions.write().await.insert(1, session);
+
+    DrainRig {
+        conn,
+        share,
+        tree,
+        open: a_open,
+        waiter,
+        close_started,
+    }
+}
+
+async fn wait_until_session_detached(conn: &Arc<Connection>) {
+    for _ in 0..2000 {
+        if conn
+            .sessions
+            .try_read()
+            .map(|sessions| sessions.is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the close never detached the session");
+}
+
+fn assert_waiters_and_range_released(rig: DrainRig) {
+    let mut waiter = rig.waiter;
+    assert_eq!(
+        waiter.try_recv().expect("the waiter completes"),
+        ntstatus::STATUS_RANGE_NOT_LOCKED
+    );
+    let fresh = LockOwner::new();
+    assert!(
+        rig.share
+            .locks
+            .try_lock("a", &fresh, &[Range::new(0, 10, true).unwrap()])
+            .is_ok(),
+        "a fresh owner can acquire the removed open's range"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_session_close_while_it_waits_for_a_tree_releases_owners() {
+    let mut rig = drain_rig().await;
+    let tree_guard = rig.tree.read().await;
+    let closer = tokio::spawn({
+        let conn = rig.conn.clone();
+        async move { conn.close_session(1).await }
+    });
+
+    wait_until_session_detached(&rig.conn).await;
+    assert!(!closer.is_finished(), "the close is waiting for the tree");
+    assert!(
+        rig.close_started.try_recv().is_err(),
+        "no Handle::close starts before the tree is drained"
+    );
+
+    closer.abort();
+    let _ = closer.await;
+    drop(tree_guard);
+    assert_waiters_and_range_released(rig);
+}
+
+#[tokio::test]
+async fn cancelling_a_session_close_while_it_waits_for_an_open_releases_owners() {
+    let mut rig = drain_rig().await;
+    let tree_id = rig.tree.read().await.id;
+    let (_drain_guard, mut drained_rx) = crate::tests::pause::drain_hook(1, tree_id);
+    let open_guard = rig.open.read().await;
+    let closer = tokio::spawn({
+        let conn = rig.conn.clone();
+        async move { conn.close_session(1).await }
+    });
+
+    drained_rx
+        .recv()
+        .await
+        .expect("the tree's opens were drained");
+    // The drain has detached every open and now awaits this read guard.
+    tokio::task::yield_now().await;
+    assert!(
+        !closer.is_finished(),
+        "the close is waiting for the open guard"
+    );
+    assert!(
+        rig.close_started.try_recv().is_err(),
+        "no Handle::close starts before the open is drained"
+    );
+
+    closer.abort();
+    let _ = closer.await;
+    drop(open_guard);
+    assert_waiters_and_range_released(rig);
 }

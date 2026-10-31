@@ -46,7 +46,12 @@ pub async fn handle(
     let want_attrs = req.flags & FLAG_POSTQUERY_ATTRIB != 0;
     let lock_owner = open.lock_owner.clone();
     drop(open);
-    conn.open_closed(&tree_arc.read().await.share, &lock_owner);
+    let (share, tree_id) = {
+        let tree = tree_arc.read().await;
+        (tree.share.clone(), tree.id)
+    };
+    conn.remove_open_owner(hdr.session_id, tree_id, &lock_owner);
+    conn.open_closed(&share, &lock_owner);
 
     if server.trace_sink.is_some() {
         crate::trace::record(

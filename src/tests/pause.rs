@@ -49,6 +49,10 @@ static BEFORE_SELECT: Mutex<Vec<Arc<Pause>>> = Mutex::new(Vec::new());
 static AFTER_CLAIM: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static BEFORE_FINAL: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static DONE: Mutex<Vec<(u64, mpsc::UnboundedSender<()>)>> = Mutex::new(Vec::new());
+type DrainKey = (u64, u32);
+type DrainWaiter = (DrainKey, mpsc::UnboundedSender<()>);
+
+static DRAINED: Mutex<Vec<DrainWaiter>> = Mutex::new(Vec::new());
 
 /// Makes the next final-response build by `target` panic before the frame is
 /// queued, so a test drives the glue failure with an armed grant.
@@ -103,6 +107,43 @@ pub(crate) fn waiter_done_hook(target: u64) -> (DoneHook, mpsc::UnboundedReceive
         .unwrap_or_else(|e| e.into_inner())
         .push((target, tx));
     (DoneHook { target }, rx)
+}
+
+/// Notifies the test once a tree's opens have been drained, before the first
+/// per-open write guard is awaited.
+pub(crate) struct DrainHook {
+    key: (u64, u32),
+}
+
+impl Drop for DrainHook {
+    fn drop(&mut self) {
+        DRAINED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(key, _)| *key != self.key);
+    }
+}
+
+pub(crate) fn drain_hook(
+    session_id: u64,
+    tree_id: u32,
+) -> (DrainHook, mpsc::UnboundedReceiver<()>) {
+    let key = (session_id, tree_id);
+    let (tx, rx) = mpsc::unbounded_channel();
+    DRAINED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((key, tx));
+    (DrainHook { key }, rx)
+}
+
+pub(crate) fn drain_reached(session_id: u64, tree_id: u32) {
+    let drained = DRAINED.lock().unwrap_or_else(|e| e.into_inner());
+    for (key, tx) in drained.iter() {
+        if *key == (session_id, tree_id) {
+            let _ = tx.send(());
+        }
+    }
 }
 
 pub(crate) fn waiter_done(target: u64) {

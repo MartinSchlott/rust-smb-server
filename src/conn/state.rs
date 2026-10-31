@@ -69,6 +69,10 @@ pub struct Connection {
     /// Requests answered `STATUS_PENDING`, by AsyncId.
     pending: Mutex<HashMap<u64, Pending>>,
     next_async_id: AtomicU64,
+    /// Lock owners of opens per (SessionId, TreeId). Cancellation can strike
+    /// at any async state-lock await during a close, so owner release must
+    /// not depend on re-entering the removed session/tree state.
+    open_owners: Mutex<HashMap<(u64, u32), TreeOwners>>,
 
     /// Idempotent close signal; the writer task selects on it.
     close: tokio::sync::watch::Sender<bool>,
@@ -93,6 +97,16 @@ pub(crate) struct Pending {
     /// Status to complete with when that open closes.
     pub(crate) on_close: u32,
     pub(crate) done: tokio::sync::oneshot::Sender<u32>,
+}
+
+/// Lock owners of one session/tree, kept outside the async tree and open
+/// locks so a removed session or tree can release them without awaiting.
+struct TreeOwners {
+    share: Option<Arc<ShareBindings>>,
+    owners: Vec<Arc<LockOwner>>,
+    /// Set when the session/tree is removed. A later registration for the
+    /// same key is refused and its owner closed at once.
+    closed: bool,
 }
 
 /// The signing facts of one session, as response building needs them.
@@ -130,6 +144,7 @@ impl Connection {
             writer: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             next_async_id: AtomicU64::new(1),
+            open_owners: Mutex::new(HashMap::new()),
             close: tokio::sync::watch::channel(false).0,
             signing: Mutex::new(SigningContext {
                 algo: SigningAlgo::HmacSha256,
@@ -270,6 +285,9 @@ impl Connection {
     /// drop with the connection as before.
     pub async fn teardown(&self) {
         self.writer.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // A synchronous sweep: it covers opens whose session/tree was already
+        // detached, and never needs an async state lock.
+        self.release_all_open_owners();
 
         let sessions: Vec<_> = self.sessions.read().await.values().cloned().collect();
         for sess_arc in sessions {
@@ -288,11 +306,108 @@ impl Connection {
         self.pending().clear();
     }
 
+    fn open_owners(&self) -> std::sync::MutexGuard<'_, HashMap<(u64, u32), TreeOwners>> {
+        self.open_owners.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record an open's lock owner for the session/tree that contains it. A
+    /// registration after that session/tree was removed is refused: the
+    /// owner is closed immediately, so an in-flight CREATE cannot leave a
+    /// lock behind on state nobody can reach any more.
+    pub(crate) fn register_open_owner(
+        &self,
+        session_id: u64,
+        tree_id: u32,
+        share: Arc<ShareBindings>,
+        owner: Arc<LockOwner>,
+    ) {
+        let refused_share = {
+            let mut owners = self.open_owners();
+            let entry = owners
+                .entry((session_id, tree_id))
+                .or_insert_with(|| TreeOwners {
+                    share: Some(share.clone()),
+                    owners: Vec::new(),
+                    closed: false,
+                });
+            if entry.closed {
+                entry.share.clone()
+            } else {
+                entry.owners.push(owner.clone());
+                None
+            }
+        };
+        if let Some(share) = refused_share {
+            self.open_closed(&share, &owner);
+        }
+    }
+
+    /// Forget an owner whose open closed explicitly. The tree/session release
+    /// path would otherwise close it again (harmless but stale).
+    pub(crate) fn remove_open_owner(&self, session_id: u64, tree_id: u32, owner: &Arc<LockOwner>) {
+        if let Some(entry) = self.open_owners().get_mut(&(session_id, tree_id)) {
+            entry.owners.retain(|o| !Arc::ptr_eq(o, owner));
+        }
+    }
+
+    fn take_tree_owners(&self, key: (u64, u32)) -> Vec<(Arc<ShareBindings>, Arc<LockOwner>)> {
+        let mut owners = self.open_owners();
+        match owners.get_mut(&key) {
+            Some(entry) => {
+                entry.closed = true;
+                let Some(share) = entry.share.clone() else {
+                    return Vec::new();
+                };
+                std::mem::take(&mut entry.owners)
+                    .into_iter()
+                    .map(|owner| (share.clone(), owner))
+                    .collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Release every lock owner of one removed tree, before any await that
+    /// could be cancelled. Idempotent.
+    pub(crate) fn release_tree_open_owners(&self, session_id: u64, tree_id: u32) {
+        for (share, owner) in self.take_tree_owners((session_id, tree_id)) {
+            self.open_closed(&share, &owner);
+        }
+    }
+
+    /// Release every lock owner of one removed session, across all its trees,
+    /// synchronously and before any await. Idempotent.
+    pub(crate) fn release_session_open_owners(&self, session_id: u64) {
+        let keys: Vec<(u64, u32)> = self
+            .open_owners()
+            .keys()
+            .filter(|(session, _)| *session == session_id)
+            .copied()
+            .collect();
+        for key in keys {
+            for (share, owner) in self.take_tree_owners(key) {
+                self.open_closed(&share, &owner);
+            }
+        }
+    }
+
+    fn release_all_open_owners(&self) {
+        let keys: Vec<(u64, u32)> = self.open_owners().keys().copied().collect();
+        for key in keys {
+            for (share, owner) in self.take_tree_owners(key) {
+                self.open_closed(&share, &owner);
+            }
+        }
+    }
+
     pub fn alloc_session_id(&self) -> u64 {
         self.next_session_id.fetch_add(1, Ordering::Relaxed)
     }
 
     pub async fn close_session(&self, session_id: u64) -> bool {
+        // Synchronous, before the first await: a cancellation while the
+        // session state is being taken apart cannot strand a lock or waiter.
+        self.release_session_open_owners(session_id);
         let removed = {
             let mut sessions = self.sessions.write().await;
             let removed = sessions.remove(&session_id);
@@ -300,7 +415,7 @@ impl Connection {
             removed
         };
         if let Some(sess_arc) = removed {
-            close_session_state(self, &sess_arc).await;
+            close_session_state(self, session_id, &sess_arc).await;
             true
         } else {
             false
@@ -308,6 +423,7 @@ impl Connection {
     }
 
     pub async fn close_tree(&self, session_id: u64, tree_id: u32) -> bool {
+        self.release_tree_open_owners(session_id, tree_id);
         let sess_arc = {
             let sessions = self.sessions.read().await;
             sessions.get(&session_id).cloned()
@@ -315,7 +431,7 @@ impl Connection {
         let Some(sess_arc) = sess_arc else {
             return false;
         };
-        remove_tree_from_session(self, &sess_arc, tree_id).await
+        remove_tree_from_session(self, &sess_arc, session_id, tree_id).await
     }
 
     pub async fn close_sessions_for_user(&self, user: &str) -> usize {
@@ -360,11 +476,14 @@ impl Connection {
     ) -> usize {
         let sessions: Vec<_> = {
             let sessions = self.sessions.read().await;
-            sessions.values().cloned().collect()
+            sessions
+                .iter()
+                .map(|(session_id, sess_arc)| (*session_id, sess_arc.clone()))
+                .collect()
         };
 
         let mut removed = 0;
-        for sess_arc in sessions {
+        for (session_id, sess_arc) in sessions {
             let tree_ids = {
                 let sess = sess_arc.read().await;
                 let trees = sess.trees.read().await;
@@ -379,7 +498,7 @@ impl Connection {
             };
 
             for tree_id in tree_ids {
-                if remove_tree_from_session(self, &sess_arc, tree_id).await {
+                if remove_tree_from_session(self, &sess_arc, session_id, tree_id).await {
                     removed += 1;
                 }
             }
@@ -388,7 +507,7 @@ impl Connection {
     }
 }
 
-async fn close_session_state(conn: &Connection, sess_arc: &Arc<RwLock<Session>>) {
+async fn close_session_state(conn: &Connection, session_id: u64, sess_arc: &Arc<RwLock<Session>>) {
     let sess = sess_arc.write().await;
     let trees: Vec<_> = sess.trees.write().await.drain().collect();
 
@@ -399,7 +518,7 @@ async fn close_session_state(conn: &Connection, sess_arc: &Arc<RwLock<Session>>)
     let mut handles = Vec::new();
     for (_tree_id, tree_arc) in trees {
         let tree = tree_arc.write().await;
-        handles.extend(drain_tree_opens(conn, &tree).await);
+        handles.extend(drain_tree_opens(conn, session_id, &tree).await);
     }
     close_handles(handles).await;
 }
@@ -407,6 +526,7 @@ async fn close_session_state(conn: &Connection, sess_arc: &Arc<RwLock<Session>>)
 async fn remove_tree_from_session(
     conn: &Connection,
     sess_arc: &Arc<RwLock<Session>>,
+    session_id: u64,
     tree_id: u32,
 ) -> bool {
     let removed = {
@@ -415,16 +535,20 @@ async fn remove_tree_from_session(
         trees.remove(&tree_id)
     };
     if let Some(tree_arc) = removed {
-        close_tree_state(conn, &tree_arc).await;
+        // The tree is detached from discoverable state at this point: release
+        // its owners synchronously, before any await that cancellation could
+        // interrupt.
+        conn.release_tree_open_owners(session_id, tree_id);
+        close_tree_state(conn, session_id, &tree_arc).await;
         true
     } else {
         false
     }
 }
 
-async fn close_tree_state(conn: &Connection, tree_arc: &Arc<RwLock<TreeConnect>>) {
+async fn close_tree_state(conn: &Connection, session_id: u64, tree_arc: &Arc<RwLock<TreeConnect>>) {
     let tree = tree_arc.write().await;
-    let handles = drain_tree_opens(conn, &tree).await;
+    let handles = drain_tree_opens(conn, session_id, &tree).await;
     // Owners are closed; no backend close should hold the removed tree's lock.
     drop(tree);
     close_handles(handles).await;
@@ -433,8 +557,16 @@ async fn close_tree_state(conn: &Connection, tree_arc: &Arc<RwLock<TreeConnect>>
 /// Drains `tree`'s opens, closing every owner's locks and pending requests
 /// first, and returns the handles for a later best-effort close. The lock
 /// work is synchronous and complete before the caller awaits any backend.
-async fn drain_tree_opens(conn: &Connection, tree: &TreeConnect) -> Vec<Box<dyn Handle>> {
+async fn drain_tree_opens(
+    conn: &Connection,
+    session_id: u64,
+    tree: &TreeConnect,
+) -> Vec<Box<dyn Handle>> {
     let opens: Vec<_> = tree.opens.write().await.drain().collect();
+    #[cfg(not(test))]
+    let _ = session_id;
+    #[cfg(test)]
+    crate::tests::pause::drain_reached(session_id, tree.id);
     let mut handles = Vec::with_capacity(opens.len());
     for (_fid, open_arc) in opens {
         let mut open = open_arc.write().await;

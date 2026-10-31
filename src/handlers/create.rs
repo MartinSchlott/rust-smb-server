@@ -271,9 +271,13 @@ pub async fn handle(
         info.is_directory,
         delete_on_close,
     );
+    let lock_owner = open.lock_owner.clone();
+    let tree_id = tree.id;
+    let share = tree.share.clone();
     let open_arc = Arc::new(tokio::sync::RwLock::new(open));
     tree.opens.write().await.insert(file_id, open_arc);
     drop(tree);
+    conn.register_open_owner(hdr.session_id, tree_id, share, lock_owner);
 
     record_create_trace(Some(
         [
