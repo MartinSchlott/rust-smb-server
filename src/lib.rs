@@ -26,6 +26,7 @@ mod fs;
 mod handlers;
 mod incident;
 pub(crate) mod info_class;
+mod lock;
 pub mod ntstatus;
 mod path;
 mod proto;
@@ -59,6 +60,8 @@ pub mod wire {
 pub(crate) mod tests {
     mod dynamic_config;
     pub(crate) mod handler_support;
+    mod lock;
     pub(crate) mod memfs;
+    pub(crate) mod pause;
     mod set_info_allocation;
 }

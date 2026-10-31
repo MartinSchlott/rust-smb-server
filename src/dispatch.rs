@@ -1,5 +1,7 @@
 //! Per-frame dispatch: parse header, route to handler, sign response, encode.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -13,9 +15,10 @@ use crate::proto::messages::{CreateRequest, Dialect, ErrorResponse, FileId};
 use tokio::time::Instant;
 use tracing::{Instrument, debug, debug_span, error, warn};
 
-use crate::conn::state::Connection;
+use crate::conn::state::{Connection, Pending};
 use crate::handlers;
 use crate::incident::{Incident, IncidentKind};
+use crate::lock::LockOwner;
 use crate::ntstatus;
 use crate::server::ServerState;
 
@@ -42,6 +45,40 @@ pub struct HandlerResponse {
     /// SESSION_SETUP on the round that produces STATUS_SUCCESS, so the
     /// session's KDF context can use the snapshot.
     pub take_preauth_snapshot_for_session: Option<u64>,
+    /// A LOCK that must wait: the dispatcher sends the interim, registers the
+    /// request and starts the waiter. `None` for an immediate answer.
+    pub(crate) wait: Option<AsyncWait>,
+}
+
+/// The dispatcher-owned part of a request that must wait for its final
+/// response: who it belongs to, what status its open's close means, what to
+/// answer when it may not wait (a compound), and the future that does the
+/// waiting.
+pub(crate) struct AsyncWait {
+    pub owner: Arc<LockOwner>,
+    /// Final status when the request's open closes.
+    pub on_close: u32,
+    /// Synchronous status when the request may not wait.
+    pub refused: u32,
+    pub work: Pin<Box<dyn Future<Output = WaitOutcome> + Send>>,
+}
+
+/// How a waiter's work ended.
+pub(crate) enum WaitOutcome {
+    /// The resource is held; `held` stays armed until the final response is
+    /// queued, and rolls back if it is dropped first.
+    Granted {
+        resp: HandlerResponse,
+        held: Box<dyn Held>,
+    },
+    Failed(u32),
+}
+
+/// A claim that rolls itself back when dropped unless [`Held::keep`] commits
+/// it. The grant guard's commit point is the successful queue of its final
+/// response.
+pub(crate) trait Held: Send {
+    fn keep(self: Box<Self>);
 }
 
 impl HandlerResponse {
@@ -53,6 +90,7 @@ impl HandlerResponse {
             override_session_id: None,
             skip_signing: false,
             take_preauth_snapshot_for_session: None,
+            wait: None,
         }
     }
 
@@ -67,6 +105,20 @@ impl HandlerResponse {
             override_session_id: None,
             skip_signing: false,
             take_preauth_snapshot_for_session: None,
+            wait: None,
+        }
+    }
+
+    /// A handler answer that is completed by the dispatcher's waiter.
+    pub(crate) fn async_wait(wait: AsyncWait) -> Self {
+        Self {
+            body: Vec::new(),
+            status: ntstatus::STATUS_SUCCESS,
+            override_tree_id: None,
+            override_session_id: None,
+            skip_signing: false,
+            take_preauth_snapshot_for_session: None,
+            wait: Some(wait),
         }
     }
 }
@@ -390,7 +442,9 @@ pub async fn dispatch_frame(
                 Some(error_response(server, conn, &sub, status))
             }
             Some(deadline) => match run_supervised(server, conn, &sub, deadline).await {
-                Supervised::Completed(handled) => complete(server, conn, &sub, handled).await,
+                Supervised::Completed(handled) => {
+                    complete(server, conn, &sub, handled, chain.len() == 1).await
+                }
                 // A CANCEL never gets a generic error response, whatever
                 // happened to its handling: the protocol leaves it unanswered.
                 Supervised::Panicked if req_hdr.command == Command::Cancel => None,
@@ -858,9 +912,11 @@ async fn handle_one(
         return Handled::Rejected(HandlerResponse::err(status));
     }
 
-    // CANCEL is fire-and-forget — no response.
+    // CANCEL is fire-and-forget — no response of its own. It finishes a
+    // pending request either by AsyncId or, failing that, by MessageId.
     if cmd == Command::Cancel {
         debug!("CANCEL received; no response");
+        conn.cancel(req_hdr.async_id(), req_hdr.message_id);
         return Handled::Cancel;
     }
 
@@ -917,15 +973,16 @@ async fn handle_one(
 
 /// Builds `sub`'s response from what its handler produced and finishes the
 /// preauth bookkeeping that depends on the response bytes. Returns `None` for
-/// a CANCEL.
+/// a CANCEL and for a request whose waiter now owns the final response.
 async fn complete(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     sub: &SubRequest,
     handled: Handled,
+    alone: bool,
 ) -> Option<Vec<u8>> {
     let req_hdr = &sub.hdr;
-    let (resp, dialect, session_preauth) = match handled {
+    let (mut resp, dialect, session_preauth) = match handled {
         Handled::Cancel => return None,
         Handled::Rejected(resp) => {
             let status = resp.status;
@@ -943,6 +1000,21 @@ async fn complete(
             session_preauth,
         } => (resp, dialect, session_preauth),
     };
+
+    // A LOCK that must wait hands its final response to a waiter task or, in
+    // a compound, is refused synchronously. Every other answer is built here.
+    if let Some(wait) = resp.wait.take() {
+        return complete_async_wait(
+            server,
+            conn,
+            req_hdr,
+            sub.trace_key,
+            sub.ordinal,
+            wait,
+            alone,
+        )
+        .await;
+    }
 
     let bytes = build_response_bytes(conn, req_hdr, resp);
     crate::trace::record(
@@ -975,6 +1047,274 @@ async fn complete(
     }
 
     Some(bytes)
+}
+
+/// A request that must wait: register it, or answer at once when its open is
+/// already closed, and start the waiter that owes its interim and final.
+async fn complete_async_wait(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    req_hdr: &Smb2Header,
+    trace_key: Option<crate::trace::TraceKey>,
+    ordinal: u32,
+    wait: AsyncWait,
+    alone: bool,
+) -> Option<Vec<u8>> {
+    // A compound cannot carry an interim response per element: refuse the
+    // wait immediately rather than send a frame ahead of the chain's earlier
+    // answers. The work never ran, so nothing is held.
+    if !alone {
+        let status = wait.refused;
+        let bytes = build_response_bytes(conn, req_hdr, HandlerResponse::err(status));
+        crate::trace::record(
+            &server.trace_sink,
+            trace_key,
+            crate::trace::TraceEvent::Response { status },
+        );
+        return Some(bytes);
+    }
+
+    let async_id = conn.alloc_async_id();
+    let (done, done_rx) = tokio::sync::oneshot::channel();
+    let pending = Pending {
+        message_id: req_hdr.message_id,
+        owner: wait.owner.clone(),
+        on_close: wait.on_close,
+        done,
+    };
+    if conn.register_pending(async_id, pending).is_err() {
+        // The open closed before registration: its close already ran, and
+        // with it this request's answer.
+        let status = wait.on_close;
+        let bytes = build_response_bytes(conn, req_hdr, HandlerResponse::err(status));
+        crate::trace::record(
+            &server.trace_sink,
+            trace_key,
+            crate::trace::TraceEvent::Response { status },
+        );
+        return Some(bytes);
+    }
+
+    spawn_async_waiter(
+        server.clone(),
+        conn.clone(),
+        WaiterRequest {
+            hdr: *req_hdr,
+            ordinal,
+            trace_key,
+            async_id,
+        },
+        wait,
+        done_rx,
+    );
+    None
+}
+
+/// The immutable identity of one waiter task.
+struct WaiterRequest {
+    hdr: Smb2Header,
+    ordinal: u32,
+    trace_key: Option<crate::trace::TraceKey>,
+    async_id: u64,
+}
+
+/// The waiter task: exactly one final response, or a closed connection.
+///
+/// The inner future computes the final and never sends it. The outer layer
+/// runs it under panic capture and then builds and queues the response — the
+/// only commit point for a grant is a successful queue.
+fn spawn_async_waiter(
+    server: Arc<ServerState>,
+    conn: Arc<Connection>,
+    request: WaiterRequest,
+    wait: AsyncWait,
+    mut done_rx: tokio::sync::oneshot::Receiver<u32>,
+) {
+    let WaiterRequest {
+        hdr,
+        ordinal,
+        trace_key,
+        async_id,
+    } = request;
+    tokio::spawn(crate::trace::scoped(trace_key, async move {
+        let outcome = crate::supervise::catch_future_unwind(waiter_inner(
+            &server,
+            &conn,
+            &hdr,
+            trace_key,
+            async_id,
+            &mut done_rx,
+            wait,
+        ))
+        .await;
+
+        match outcome {
+            Ok(Some((resp, held))) => {
+                let glue = async {
+                    let mut final_hdr = hdr;
+                    // The interim granted the request's credits; the final
+                    // grants none.
+                    final_hdr.credit_request_response = 0;
+                    let status = resp.status;
+                    let bytes =
+                        build_response_bytes_with_async(&conn, &final_hdr, resp, Some(async_id));
+                    crate::trace::record(
+                        &server.trace_sink,
+                        trace_key,
+                        crate::trace::TraceEvent::Response { status },
+                    );
+                    let accepted = conn.send(bytes).await;
+                    if accepted {
+                        if let Some(held) = held {
+                            held.keep();
+                        }
+                    } else {
+                        // The connection is ending; do not leave the range
+                        // granted for a client that will never hear of it.
+                        drop(held);
+                    }
+                };
+                if let Err(payload) = crate::supervise::catch_future_unwind(glue).await {
+                    crate::supervise::report_glue_panic(&server, &conn, &*payload);
+                }
+            }
+            Ok(None) => {
+                // Teardown dropped the pending entry without a status: the
+                // connection has ended and no final is owed.
+            }
+            Err(payload) => {
+                // A still registered pending entry is dropped; a claim that
+                // unwound has already rolled itself back.
+                conn.take_pending(async_id);
+                let status = match done_rx.try_recv() {
+                    Ok(status) => status,
+                    Err(_) => ntstatus::STATUS_INTERNAL_ERROR,
+                };
+                crate::supervise::emit(
+                    &server,
+                    &conn,
+                    Incident {
+                        at: SystemTime::now(),
+                        connection_id: conn.connection_id,
+                        kind: IncidentKind::Panicked {
+                            message: crate::supervise::panic_message(&*payload),
+                        },
+                        command: Some(command_name(hdr.command)),
+                        message_id: Some(hdr.message_id),
+                        compound_ordinal: Some(ordinal),
+                        path: None,
+                    },
+                );
+                let glue = async {
+                    let mut final_hdr = hdr;
+                    final_hdr.credit_request_response = 0;
+                    let bytes = build_response_bytes_with_async(
+                        &conn,
+                        &final_hdr,
+                        HandlerResponse::err(status),
+                        Some(async_id),
+                    );
+                    crate::trace::record(
+                        &server.trace_sink,
+                        trace_key,
+                        crate::trace::TraceEvent::Response { status },
+                    );
+                    conn.send(bytes).await;
+                };
+                if let Err(payload) = crate::supervise::catch_future_unwind(glue).await {
+                    crate::supervise::report_glue_panic(&server, &conn, &*payload);
+                }
+            }
+        }
+    }));
+}
+
+/// The waiter's inner future. Sends the interim itself, races `done` against
+/// the work, and returns the final response plus a still-armed claim when the
+/// grant was claimed. It never calls `keep`: only the outer layer commits.
+async fn waiter_inner(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    hdr: &Smb2Header,
+    trace_key: Option<crate::trace::TraceKey>,
+    async_id: u64,
+    done_rx: &mut tokio::sync::oneshot::Receiver<u32>,
+    wait: AsyncWait,
+) -> Option<(HandlerResponse, Option<Box<dyn Held>>)> {
+    let AsyncWait {
+        owner: _owner,
+        on_close: _,
+        refused: _,
+        mut work,
+    } = wait;
+
+    let interim = build_response_bytes_with_async(
+        conn,
+        hdr,
+        HandlerResponse::err(ntstatus::STATUS_PENDING),
+        Some(async_id),
+    );
+    crate::trace::record(
+        &server.trace_sink,
+        trace_key,
+        crate::trace::TraceEvent::Response {
+            status: ntstatus::STATUS_PENDING,
+        },
+    );
+    conn.send(interim).await;
+
+    tokio::select! {
+        status = &mut *done_rx => match status {
+            Ok(status) => Some((HandlerResponse::err(status), None)),
+            // Teardown dropped the entry: the connection has ended.
+            Err(_) => None,
+        },
+        outcome = &mut work => match outcome {
+            WaitOutcome::Granted { resp, held } => {
+                #[cfg(test)]
+                crate::tests::pause::lock_waiter(_owner.id()).await;
+                if conn.take_pending(async_id) {
+                    #[cfg(test)]
+                    crate::tests::pause::after_claim(_owner.id());
+                    Some((resp, Some(held)))
+                } else {
+                    // Cancelled or closed as the range came free: give it
+                    // back and finish with the status that won.
+                    drop(held);
+                    match done_rx.await {
+                        Ok(status) => Some((HandlerResponse::err(status), None)),
+                        Err(_) => None,
+                    }
+                }
+            }
+            WaitOutcome::Failed(status) => {
+                // The close delivered `on_close` after closing the owner; use
+                // the status the pending entry actually carried, if any.
+                let _ = status;
+                match done_rx.await {
+                // Close delivers `on_close` after it closes the owner; CANCEL
+                // delivers its own status. Either one is this request's final.
+                Ok(status) => Some((HandlerResponse::err(status), None)),
+                // Teardown: no final on a connection that has ended.
+                Err(_) => None,
+                }
+            }
+        },
+    }
+}
+
+/// Test seam for the dispatcher-owned waiter, so a test can inject a
+/// synthetic wait through the real completion path.
+#[cfg(test)]
+pub(crate) async fn dispatch_synthetic_wait(
+    server: &Arc<ServerState>,
+    conn: &Arc<Connection>,
+    hdr: Smb2Header,
+    trace_key: Option<crate::trace::TraceKey>,
+    wait: AsyncWait,
+    alone: bool,
+) -> Option<Vec<u8>> {
+    complete_async_wait(server, conn, &hdr, trace_key, 0, wait, alone).await
 }
 
 /// Stable, `'static` command name for `TraceEvent::Request` — never the
@@ -1076,16 +1416,33 @@ fn build_response_bytes(
     req_hdr: &Smb2Header,
     handler_resp: HandlerResponse,
 ) -> Vec<u8> {
+    build_response_bytes_with_async(conn, req_hdr, handler_resp, None)
+}
+
+/// As [`build_response_bytes`], in the async header form when `async_id` is
+/// set. Synchronous for the same reason: the waiter's final response must be
+/// buildable without awaiting a handler's lock.
+fn build_response_bytes_with_async(
+    conn: &Connection,
+    req_hdr: &Smb2Header,
+    handler_resp: HandlerResponse,
+    async_id: Option<u64>,
+) -> Vec<u8> {
     let mut hdr = *req_hdr;
     hdr.flags |= SMB2_FLAGS_SERVER_TO_REDIR;
-    hdr.flags &= !SMB2_FLAGS_ASYNC_COMMAND;
     hdr.next_command = 0;
     hdr.channel_sequence_status = handler_resp.status;
-    hdr.tail = HeaderTail::sync(
-        handler_resp
-            .override_tree_id
-            .unwrap_or_else(|| req_hdr.tree_id().unwrap_or(0)),
-    );
+    if let Some(async_id) = async_id {
+        hdr.flags |= SMB2_FLAGS_ASYNC_COMMAND;
+        hdr.tail = HeaderTail::async_(async_id);
+    } else {
+        hdr.flags &= !SMB2_FLAGS_ASYNC_COMMAND;
+        hdr.tail = HeaderTail::sync(
+            handler_resp
+                .override_tree_id
+                .unwrap_or_else(|| req_hdr.tree_id().unwrap_or(0)),
+        );
+    }
     if let Some(sid) = handler_resp.override_session_id {
         hdr.session_id = sid;
     }
