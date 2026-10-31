@@ -1,7 +1,7 @@
 //! Connection / session / tree / open state held during a single TCP
 //! connection's lifetime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -72,7 +72,7 @@ pub struct Connection {
     /// Lock owners of opens per (SessionId, TreeId). Cancellation can strike
     /// at any async state-lock await during a close, so owner release must
     /// not depend on re-entering the removed session/tree state.
-    open_owners: Mutex<HashMap<(u64, u32), TreeOwners>>,
+    open_owners: Mutex<OwnerRegistry>,
 
     /// Idempotent close signal; the writer task selects on it.
     close: tokio::sync::watch::Sender<bool>,
@@ -102,11 +102,21 @@ pub(crate) struct Pending {
 /// Lock owners of one session/tree, kept outside the async tree and open
 /// locks so a removed session or tree can release them without awaiting.
 struct TreeOwners {
-    share: Option<Arc<ShareBindings>>,
+    share: Arc<ShareBindings>,
     owners: Vec<Arc<LockOwner>>,
-    /// Set when the session/tree is removed. A later registration for the
-    /// same key is refused and its owner closed at once.
-    closed: bool,
+}
+
+/// The lock-owner registry plus the removal tombstones a late registration
+/// must observe. All of it is one synchronous mutex, so a registration and a
+/// session/tree release are linearized: an in-flight CREATE either registers
+/// before the release (which then closes the owner) or after it (and is
+/// refused and closed at once).
+#[derive(Default)]
+struct OwnerRegistry {
+    trees: HashMap<(u64, u32), TreeOwners>,
+    closed_sessions: HashSet<u64>,
+    closed_trees: HashSet<(u64, u32)>,
+    closed_all: bool,
 }
 
 /// The signing facts of one session, as response building needs them.
@@ -144,7 +154,7 @@ impl Connection {
             writer: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             next_async_id: AtomicU64::new(1),
-            open_owners: Mutex::new(HashMap::new()),
+            open_owners: Mutex::new(OwnerRegistry::default()),
             close: tokio::sync::watch::channel(false).0,
             signing: Mutex::new(SigningContext {
                 algo: SigningAlgo::HmacSha256,
@@ -306,7 +316,7 @@ impl Connection {
         self.pending().clear();
     }
 
-    fn open_owners(&self) -> std::sync::MutexGuard<'_, HashMap<(u64, u32), TreeOwners>> {
+    fn open_owners(&self) -> std::sync::MutexGuard<'_, OwnerRegistry> {
         self.open_owners.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -321,23 +331,27 @@ impl Connection {
         share: Arc<ShareBindings>,
         owner: Arc<LockOwner>,
     ) {
-        let refused_share = {
-            let mut owners = self.open_owners();
-            let entry = owners
-                .entry((session_id, tree_id))
-                .or_insert_with(|| TreeOwners {
-                    share: Some(share.clone()),
-                    owners: Vec::new(),
-                    closed: false,
-                });
-            if entry.closed {
-                entry.share.clone()
+        let refused = {
+            let mut registry = self.open_owners();
+            if registry.closed_all
+                || registry.closed_sessions.contains(&session_id)
+                || registry.closed_trees.contains(&(session_id, tree_id))
+            {
+                Some(share.clone())
             } else {
-                entry.owners.push(owner.clone());
+                registry
+                    .trees
+                    .entry((session_id, tree_id))
+                    .or_insert_with(|| TreeOwners {
+                        share: share.clone(),
+                        owners: Vec::new(),
+                    })
+                    .owners
+                    .push(owner.clone());
                 None
             }
         };
-        if let Some(share) = refused_share {
+        if let Some(share) = refused {
             self.open_closed(&share, &owner);
         }
     }
@@ -345,32 +359,34 @@ impl Connection {
     /// Forget an owner whose open closed explicitly. The tree/session release
     /// path would otherwise close it again (harmless but stale).
     pub(crate) fn remove_open_owner(&self, session_id: u64, tree_id: u32, owner: &Arc<LockOwner>) {
-        if let Some(entry) = self.open_owners().get_mut(&(session_id, tree_id)) {
+        if let Some(entry) = self.open_owners().trees.get_mut(&(session_id, tree_id)) {
             entry.owners.retain(|o| !Arc::ptr_eq(o, owner));
         }
     }
 
-    fn take_tree_owners(&self, key: (u64, u32)) -> Vec<(Arc<ShareBindings>, Arc<LockOwner>)> {
-        let mut owners = self.open_owners();
-        match owners.get_mut(&key) {
-            Some(entry) => {
-                entry.closed = true;
-                let Some(share) = entry.share.clone() else {
-                    return Vec::new();
-                };
-                std::mem::take(&mut entry.owners)
-                    .into_iter()
-                    .map(|owner| (share.clone(), owner))
-                    .collect()
-            }
-            None => Vec::new(),
-        }
+    fn take_tree_owners(
+        registry: &mut OwnerRegistry,
+        key: (u64, u32),
+    ) -> Vec<(Arc<ShareBindings>, Arc<LockOwner>)> {
+        registry.closed_trees.insert(key);
+        let Some(entry) = registry.trees.remove(&key) else {
+            return Vec::new();
+        };
+        entry
+            .owners
+            .into_iter()
+            .map(|owner| (entry.share.clone(), owner))
+            .collect()
     }
 
     /// Release every lock owner of one removed tree, before any await that
     /// could be cancelled. Idempotent.
     pub(crate) fn release_tree_open_owners(&self, session_id: u64, tree_id: u32) {
-        for (share, owner) in self.take_tree_owners((session_id, tree_id)) {
+        let released = {
+            let mut registry = self.open_owners();
+            Self::take_tree_owners(&mut registry, (session_id, tree_id))
+        };
+        for (share, owner) in released {
             self.open_closed(&share, &owner);
         }
     }
@@ -378,25 +394,39 @@ impl Connection {
     /// Release every lock owner of one removed session, across all its trees,
     /// synchronously and before any await. Idempotent.
     pub(crate) fn release_session_open_owners(&self, session_id: u64) {
-        let keys: Vec<(u64, u32)> = self
-            .open_owners()
-            .keys()
-            .filter(|(session, _)| *session == session_id)
-            .copied()
-            .collect();
-        for key in keys {
-            for (share, owner) in self.take_tree_owners(key) {
-                self.open_closed(&share, &owner);
+        let released = {
+            let mut registry = self.open_owners();
+            registry.closed_sessions.insert(session_id);
+            let keys: Vec<(u64, u32)> = registry
+                .trees
+                .keys()
+                .filter(|(session, _)| *session == session_id)
+                .copied()
+                .collect();
+            let mut released = Vec::new();
+            for key in keys {
+                released.extend(Self::take_tree_owners(&mut registry, key));
             }
+            released
+        };
+        for (share, owner) in released {
+            self.open_closed(&share, &owner);
         }
     }
 
     fn release_all_open_owners(&self) {
-        let keys: Vec<(u64, u32)> = self.open_owners().keys().copied().collect();
-        for key in keys {
-            for (share, owner) in self.take_tree_owners(key) {
-                self.open_closed(&share, &owner);
+        let released = {
+            let mut registry = self.open_owners();
+            registry.closed_all = true;
+            let keys: Vec<(u64, u32)> = registry.trees.keys().copied().collect();
+            let mut released = Vec::new();
+            for key in keys {
+                released.extend(Self::take_tree_owners(&mut registry, key));
             }
+            released
+        };
+        for (share, owner) in released {
+            self.open_closed(&share, &owner);
         }
     }
 
