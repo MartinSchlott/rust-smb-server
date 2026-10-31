@@ -340,6 +340,34 @@ impl Rig {
         owner_of(&self.conn, self.session_id, self.tree_id, file_id).await
     }
 
+    async fn open_arc(&self, file_id: FileId) -> Arc<RwLock<Open>> {
+        let session = self
+            .conn
+            .sessions
+            .read()
+            .await
+            .get(&self.session_id)
+            .cloned()
+            .expect("session");
+        let tree = session
+            .read()
+            .await
+            .trees
+            .read()
+            .await
+            .get(&self.tree_id)
+            .cloned()
+            .expect("tree");
+        tree.read()
+            .await
+            .opens
+            .read()
+            .await
+            .get(&file_id)
+            .cloned()
+            .expect("open")
+    }
+
     async fn close(&mut self, file_id: FileId) -> u32 {
         let (_, outcome) = self.call(Command::Close, close_request(file_id)).await;
         status_of(outcome)
@@ -1373,7 +1401,13 @@ async fn install_open(
         false,
     );
     let owner = open.lock_owner.clone();
-    conn.register_open_owner(session_id, tree.id, tree.share.clone(), owner.clone());
+    conn.register_open_owner(
+        session_id,
+        tree.id,
+        file_id,
+        tree.share.clone(),
+        owner.clone(),
+    );
     tree.opens
         .write()
         .await
@@ -1572,7 +1606,7 @@ async fn drain_rig() -> DrainRig {
         false,
     );
     let a_owner = a_open.lock_owner.clone();
-    conn.register_open_owner(1, tree.id, share.clone(), a_owner.clone());
+    conn.register_open_owner(1, tree.id, a_fid, share.clone(), a_owner.clone());
     let a_open = Arc::new(RwLock::new(a_open));
     tree.opens.write().await.insert(a_fid, a_open.clone());
     share
@@ -1593,7 +1627,7 @@ async fn drain_rig() -> DrainRig {
         false,
     );
     let b_owner = b_open.lock_owner.clone();
-    conn.register_open_owner(1, tree.id, share.clone(), b_owner.clone());
+    conn.register_open_owner(1, tree.id, b_fid, share.clone(), b_owner.clone());
     tree.opens
         .write()
         .await
@@ -1714,4 +1748,67 @@ async fn cancelling_a_session_close_while_it_waits_for_an_open_releases_owners()
     let _ = closer.await;
     drop(open_guard);
     assert_waiters_and_range_released(rig);
+}
+
+#[tokio::test]
+async fn a_timed_out_close_releases_the_removed_open_before_its_write_guard() {
+    let mut rig = Rig::with(
+        Arc::new(MemFsBackend::new().with_file("db", b"0123456789")),
+        Duration::from_millis(150),
+        None,
+    )
+    .await;
+    let holder = rig.open("db").await;
+    let closing = rig.open("db").await;
+    assert_eq!(
+        rig.lock(holder, 20, 10, EX | NOW).await,
+        ntstatus::STATUS_SUCCESS
+    );
+    assert_eq!(
+        rig.lock(closing, 0, 10, EX | NOW).await,
+        ntstatus::STATUS_SUCCESS
+    );
+    // This open both holds (0,10) and waits on (20,10).
+    let (_, outcome) = rig
+        .call(Command::Lock, lock_body(closing, 20, 10, EX))
+        .await;
+    assert!(matches!(outcome, FrameOutcome::NoResponse));
+    let (interim, _) = rig.next_frame().await;
+    let async_id = interim.async_id().expect("async id");
+
+    // A READ holds this open's read guard across its backend call; CLOSE must
+    // release the owner at the detach boundary, not after acquiring this
+    // write guard.
+    let open_arc = rig.open_arc(closing).await;
+    let open_guard = open_arc.read().await;
+
+    let (_, outcome) = rig.call(Command::Close, close_request(closing)).await;
+    assert_eq!(
+        status_of(outcome),
+        ntstatus::STATUS_IO_TIMEOUT,
+        "the close is cancelled while waiting for the open guard"
+    );
+
+    // The connection stays usable after the cancelled CLOSE.
+    let mut echo = Vec::new();
+    EchoRequest::default().write_to(&mut echo).unwrap();
+    let (_, outcome) = rig.call(Command::Echo, echo).await;
+    assert_eq!(status_of(outcome), ntstatus::STATUS_SUCCESS);
+
+    // The waiter on the closed open completes even though CLOSE timed out.
+    let (final_hdr, _) = rig.next_frame().await;
+    assert_eq!(
+        (final_hdr.channel_sequence_status, final_hdr.async_id()),
+        (ntstatus::STATUS_RANGE_NOT_LOCKED, Some(async_id))
+    );
+
+    drop(open_guard);
+    let fresh = LockOwner::new();
+    assert!(
+        rig.share
+            .locks
+            .try_lock("db", &fresh, &[Range::new(0, 10, true).unwrap()])
+            .is_ok(),
+        "the closed open's held range was released at detach"
+    );
 }

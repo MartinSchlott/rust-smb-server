@@ -38,6 +38,12 @@ pub async fn handle(
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
 
+    // The open is detached from the tree: release its owner by FileId now,
+    // before the write guard that a READ may be holding. A cancelled CLOSE
+    // must not leave a removed open's ranges or pending waits alive.
+    let tree_id = hdr.tree_id().unwrap_or(0);
+    conn.release_open_owner(hdr.session_id, tree_id, req.file_id);
+
     // Pull state out, close the handle, then optionally unlink.
     let mut open = open_arc.write().await;
     let handle = open.handle.take();
@@ -46,11 +52,9 @@ pub async fn handle(
     let want_attrs = req.flags & FLAG_POSTQUERY_ATTRIB != 0;
     let lock_owner = open.lock_owner.clone();
     drop(open);
-    let (share, tree_id) = {
-        let tree = tree_arc.read().await;
-        (tree.share.clone(), tree.id)
-    };
-    conn.remove_open_owner(hdr.session_id, tree_id, &lock_owner);
+    let share = tree_arc.read().await.share.clone();
+    // Fallback for an open that predates the registry; idempotent when the
+    // FileId release above already closed this owner.
     conn.open_closed(&share, &lock_owner);
 
     if server.trace_sink.is_some() {

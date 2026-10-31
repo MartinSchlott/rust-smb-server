@@ -277,7 +277,7 @@ pub async fn handle(
     let open_arc = Arc::new(tokio::sync::RwLock::new(open));
     tree.opens.write().await.insert(file_id, open_arc);
     drop(tree);
-    conn.register_open_owner(hdr.session_id, tree_id, share, lock_owner);
+    conn.register_open_owner(hdr.session_id, tree_id, file_id, share, lock_owner);
 
     record_create_trace(Some(
         [

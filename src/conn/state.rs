@@ -103,7 +103,7 @@ pub(crate) struct Pending {
 /// locks so a removed session or tree can release them without awaiting.
 struct TreeOwners {
     share: Arc<ShareBindings>,
-    owners: Vec<Arc<LockOwner>>,
+    owners: Vec<(FileId, Arc<LockOwner>)>,
 }
 
 /// The lock-owner registry plus the removal tombstones a late registration
@@ -328,6 +328,7 @@ impl Connection {
         &self,
         session_id: u64,
         tree_id: u32,
+        file_id: FileId,
         share: Arc<ShareBindings>,
         owner: Arc<LockOwner>,
     ) {
@@ -347,7 +348,7 @@ impl Connection {
                         owners: Vec::new(),
                     })
                     .owners
-                    .push(owner.clone());
+                    .push((file_id, owner.clone()));
                 None
             }
         };
@@ -356,11 +357,31 @@ impl Connection {
         }
     }
 
-    /// Forget an owner whose open closed explicitly. The tree/session release
-    /// path would otherwise close it again (harmless but stale).
-    pub(crate) fn remove_open_owner(&self, session_id: u64, tree_id: u32, owner: &Arc<LockOwner>) {
-        if let Some(entry) = self.open_owners().trees.get_mut(&(session_id, tree_id)) {
-            entry.owners.retain(|o| !Arc::ptr_eq(o, owner));
+    /// Release the owner of one explicitly closed open, addressed by FileId so
+    /// the CLOSE path never needs the detached Open's async write guard.
+    /// Returns whether a registration was found. Idempotent.
+    pub(crate) fn release_open_owner(
+        &self,
+        session_id: u64,
+        tree_id: u32,
+        file_id: FileId,
+    ) -> bool {
+        let released = {
+            let mut registry = self.open_owners();
+            let Some(entry) = registry.trees.get_mut(&(session_id, tree_id)) else {
+                return false;
+            };
+            let Some(index) = entry.owners.iter().position(|(id, _)| *id == file_id) else {
+                return false;
+            };
+            let (_, owner) = entry.owners.remove(index);
+            Some((entry.share.clone(), owner))
+        };
+        if let Some((share, owner)) = released {
+            self.open_closed(&share, &owner);
+            true
+        } else {
+            false
         }
     }
 
@@ -375,7 +396,7 @@ impl Connection {
         entry
             .owners
             .into_iter()
-            .map(|owner| (entry.share.clone(), owner))
+            .map(|(_, owner)| (entry.share.clone(), owner))
             .collect()
     }
 
