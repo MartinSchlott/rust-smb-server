@@ -195,7 +195,7 @@ impl SmbServerBuilder {
         self
     }
 
-    /// Arms the request trace (`docs/PLAN_smb_round_two.md` Step 1a). Absent
+    /// Arms the request trace. Absent
     /// (the default), every recording site is a null check and nothing is
     /// allocated or formatted — this method is the only way to change that.
     pub fn trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {

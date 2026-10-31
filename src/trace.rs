@@ -1,5 +1,5 @@
-//! Optional, caller-supplied request trace (`docs/PLAN_smb_round_two.md`
-//! Step 1a/1b). No logging framework, no stdout: this crate never decides
+//! Optional, caller-supplied request trace. No logging framework, no
+//! stdout: this crate never decides
 //! *where* diagnostics go — it hands correlated events to whatever
 //! `Arc<dyn TraceSink>` the caller wired in via
 //! `SmbServer::builder().trace_sink(...)`. Absent (the default, `None`),
@@ -73,8 +73,7 @@ pub enum TraceEvent {
         desired_access: u32,
         /// `None` when `backend.open()` failed — MS-SMB2 assigns no FileId
         /// to a CREATE that never opened anything. Recorded regardless of
-        /// outcome (`docs/SMB_DEFECTS.md` hygiene gap #6 in the prosopon
-        /// consumer): a failing CREATE's disposition/access-mask is exactly
+        /// outcome: a failing CREATE's disposition/access-mask is exactly
         /// what's needed to tell a server-side rejection apart from a
         /// client that never attempted what the trace's surrounding
         /// context assumed it would.
@@ -110,7 +109,7 @@ pub enum TraceEvent {
     },
     /// A backend-layer (`ShareBackend`/`Handle`) event. The fork does not
     /// know backend internals; `text` is whatever the caller's own backend
-    /// trace (e.g. prosopon's `BackendOp`) chose to format — still subject
+    /// trace chose to format — still subject
     /// to the "no file content" rule above.
     Backend { text: String },
 }
@@ -132,8 +131,8 @@ pub trait TraceSink: Send + Sync {
 
 tokio::task_local! {
     /// The current request's trace key, bound for the duration of the
-    /// dispatcher's backend call. Mirrors prosopon's own `wirelog.rs`
-    /// `REQUEST_ID` task-local — same mechanism, same reason: an SMB
+    /// dispatcher's backend call. Mirrors a consumer's own task-local request
+    /// id — same mechanism, same reason: an SMB
     /// connection serves concurrent, interleaved requests, so a backend
     /// event with no key would be ambiguous the moment two requests
     /// overlap.

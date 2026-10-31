@@ -171,7 +171,7 @@ impl CreateContext {
     pub const NAME_RQLS: &'static [u8; 4] = b"RqLs"; // REQUEST_LEASE
     pub const NAME_DH2Q: &'static [u8; 4] = b"DH2Q"; // DURABLE_HANDLE_REQUEST_V2
     pub const NAME_DH2C: &'static [u8; 4] = b"DH2C"; // DURABLE_HANDLE_RECONNECT_V2
-    pub const NAME_AAPL: &'static [u8; 4] = b"AAPL"; // Apple SMB2_CRTCTX_AAPL (not MS-SMB2; see docs/SMB_DEFECTS.md)
+    pub const NAME_AAPL: &'static [u8; 4] = b"AAPL"; // Apple SMB2_CRTCTX_AAPL (not MS-SMB2)
 
     /// Parse a chain of create-contexts from the raw chain bytes.
     ///
@@ -444,7 +444,7 @@ mod tests {
     /// context named "AAPL" with a 24-byte payload —
     /// CommandCode(4)=SERVER_QUERY(1), Reserved(4), RequestBitmap(8),
     /// ClientCapabilities(8). This is Step 1 of the S2/S10 investigation
-    /// (`docs/SMB_DEFECTS.md`): confirm `parse_chain` decodes a real AAPL
+    ///: confirm `parse_chain` decodes a real AAPL
     /// context correctly before concluding anything about whether the
     /// client sends one.
     #[test]

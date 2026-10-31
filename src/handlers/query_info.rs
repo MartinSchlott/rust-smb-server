@@ -163,8 +163,7 @@ pub async fn handle(
                     // backend actually honours `SmbPath::stream_name()` —
                     // claiming it otherwise would make macOS attempt
                     // stream-backed xattr writes against a backend that
-                    // silently drops them onto the primary data stream
-                    // (docs/SMB_DEFECTS.md S2/S10 in the prosopon consumer).
+                    // silently drops them onto the primary data stream.
                     let backend = {
                         let tree = tree_arc.read().await;
                         tree.share.backend.clone()

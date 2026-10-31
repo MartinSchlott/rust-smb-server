@@ -161,7 +161,7 @@ impl ActiveConnections {
     /// Mints a fresh, per-accepted-socket connection id. Split from
     /// `insert` so a caller can stamp the id onto `Connection` itself
     /// (`Connection::connection_id` — the trace key's `connection_id`
-    /// component, `docs/PLAN_smb_round_two.md` Step 1a) before the
+    /// component) before the
     /// `Connection` is wrapped in the `Arc` this table stores.
     pub fn alloc_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
@@ -213,8 +213,7 @@ pub struct ServerState {
     /// iteration and connection loops abandon their next read.
     pub shutdown: Arc<Notify>,
     pub shutting_down: Arc<AtomicBool>,
-    /// `None` unless `SmbServer::builder().trace_sink(...)` was called
-    /// (`docs/PLAN_smb_round_two.md` Step 1a).
+    /// `None` unless `SmbServer::builder().trace_sink(...)` was called.
     pub trace_sink: crate::trace::SinkHandle,
     /// Receiver of dispatch incidents; `None` falls back to `tracing`.
     pub incident_sink: crate::incident::IncidentSinkHandle,

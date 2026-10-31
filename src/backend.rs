@@ -193,8 +193,8 @@ pub struct BackendCapabilities {
     /// retrieving a named stream separately from the file's primary data.
     /// Advertised to clients as `FILE_NAMED_STREAMS` (MS-FSCC §2.5.1) so
     /// they don't fall back to embedding stream-shaped data (e.g. macOS's
-    /// AFPInfo/Finder-info/xattr writes) into the primary data stream —
-    /// see `docs/SMB_DEFECTS.md` S2/S10 in the prosopon consumer.
+    /// AFPInfo/Finder-info/xattr writes) into the primary data stream,
+    /// where they would be indistinguishable from file content.
     pub supports_named_streams: bool,
     /// True iff the backend implements `Handle::read_link`/`set_symlink` and
     /// presents symlinks as `IO_REPARSE_TAG_SYMLINK` reparse points.

@@ -1,5 +1,5 @@
-//! Cross-stack trace integration tests (`docs/PLAN_smb_round_two.md` Step 1a/1c):
-//! a real CREATE+WRITE+CLOSE over the wire, with a capturing `TraceSink`
+//! Cross-stack trace integration tests: a real CREATE+WRITE+CLOSE over the
+//! wire, with a capturing `TraceSink`
 //! wired into the server, proving — against actually-dispatched traffic,
 //! not hand-built events — that the trace carries `create_options` and
 //! never carries written bytes.

@@ -1,4 +1,0 @@
-# Local build storage bypasses the Prosopon SMB projection.
-# Machine-specific absolute path; see MyProjects/RUST_BUILD_STORAGE.md.
-[build]
-target-dir = "/Users/martinschlott/Documents/MyProjects/RustBuildTargets/rust-smb-server"

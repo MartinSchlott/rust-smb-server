@@ -848,7 +848,7 @@ fn read_u64(buf: &[u8], offset: usize) -> u64 {
 }
 
 /// Frames that MUST NOT be dispatched concurrently with anything else on
-/// their connection (PLAN_PERF1 Step 6).
+/// their connection.
 ///
 /// Returns `true` if **any** sub-command in the compound chain is
 /// `Negotiate`, `SessionSetup`, `Logoff`, `TreeConnect` or
@@ -1574,8 +1574,8 @@ mod tests {
         Arc::new(Connection::new(1, Uuid::nil(), 1024 * 1024, 1024 * 1024))
     }
 
-    // ── Trace key generation through the real dispatcher (docs/PLAN_smb_round_two.md
-    // Step 1a/1b — the reviewed gate: not just two hand-built `TraceKey` values) ──
+    // ── Trace key generation through the real dispatcher — the reviewed gate:
+    // not just two hand-built `TraceKey` values ──
 
     struct CaptureSink {
         events: std::sync::Mutex<Vec<(Option<crate::trace::TraceKey>, String)>>,
@@ -1795,7 +1795,7 @@ mod tests {
         assert!(!conn.session_preauth.read().await.contains_key(&7));
     }
 
-    // ── PLAN_PERF1 Step 6/8.6 — `frame_must_be_serialized` table test ──────
+    // ── `frame_must_be_serialized` table test ──────────────────────────────
 
     /// One sub-frame: exactly `SMB2_HEADER_LEN` bytes, header only, no body
     /// — the predicate never looks past the header, so a body adds nothing

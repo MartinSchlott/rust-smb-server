@@ -166,9 +166,9 @@ pub async fn handle(
     }
     // MS-SMB2 §2.2.13: FILE_DIRECTORY_FILE is valid only paired with
     // FILE_CREATE, FILE_OPEN_IF, or FILE_OPEN — never with a disposition
-    // that overwrites or truncates. Validated here, in the fork's own
-    // handler, before any backend is called; `smb.rs`'s adapter does not
-    // duplicate this check (`docs/PLAN_smb_round_two.md` Step 2, Stage 1).
+    // that overwrites or truncates. Validated here, in the server's own
+    // handler, before any backend is called; a consumer's adapter does not
+    // duplicate this check.
     if directory && matches!(intent, OpenIntent::OverwriteOrCreate | OpenIntent::Truncate) {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
@@ -234,9 +234,8 @@ pub async fn handle(
         Ok(h) => h,
         Err(e) => {
             debug!(error = %e, path = %path, "backend open failed");
-            // Traced regardless of outcome (`docs/SMB_DEFECTS.md` hygiene
-            // gap #6 in the prosopon consumer) — a failing CREATE never
-            // gets a FileId, so `file_id: None`.
+            // Traced regardless of outcome — a failing CREATE never gets a
+            // FileId, so `file_id: None`.
             record_create_trace(None);
             return HandlerResponse::err(e.to_nt_status());
         }
@@ -331,8 +330,7 @@ pub async fn handle(
     HandlerResponse::ok(buf)
 }
 
-/// `SMB2_CRTCTX_AAPL` "server query" (`docs/SMB_DEFECTS.md` S2/S10
-/// investigation, Step 2). Wire format per Apple's Time Machine over SMB
+/// `SMB2_CRTCTX_AAPL` "server query". Wire format per Apple's Time Machine over SMB
 /// spec and Samba's `vfs_fruit.c` `check_aapl()` (cross-checked against
 /// each other — see the `parse_chain` fixture tests in
 /// `proto/messages/create.rs`). Only `SERVER_CAPS` and `VOLUME_CAPS` are
@@ -386,7 +384,7 @@ fn build_aapl_response_context(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 1 handler tests (`docs/PLAN_smb_round_two.md` Step 2)
+// CREATE handler tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -687,7 +685,7 @@ mod tests {
         );
     }
 
-    // -- Named streams (docs/SMB_DEFECTS.md S2/S10, Step 3) -----------------
+    // -- Named streams ------------------------------------------------------
 
     #[tokio::test]
     async fn stream_create_on_an_existing_file_reaches_the_backend() {
@@ -726,7 +724,7 @@ mod tests {
         assert_eq!(resp.status, ntstatus::STATUS_INVALID_PARAMETER);
     }
 
-    // -- AAPL create context (docs/SMB_DEFECTS.md S2/S10, Step 2) ----------
+    // -- AAPL create context -----------------------------------------------
 
     #[test]
     fn build_aapl_response_context_answers_both_requested_bitmaps() {
@@ -848,8 +846,7 @@ mod tests {
         assert!(create_resp.create_contexts.is_empty());
     }
 
-    // -- Trace hygiene: CREATE is traced on failure too (docs/SMB_DEFECTS.md
-    // -- hygiene gap #6 / S9 investigation) -----------------------------------
+    // -- Trace hygiene: CREATE is traced on failure too ---------------------
 
     struct CaptureSink {
         events: std::sync::Mutex<Vec<crate::trace::TraceEvent>>,
@@ -1002,7 +999,7 @@ mod tests {
         }
     }
 
-    // -- Delete-on-close preflight (PLAN_delete_refusal_reported) ----------
+    // -- Delete-on-close preflight -----------------------------------------
 
     #[tokio::test]
     async fn a_refused_delete_on_close_create_returns_the_status_and_leaves_no_open() {

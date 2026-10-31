@@ -121,7 +121,7 @@ async fn run_frame(
 /// whose framing or compound chain is malformed closes the connection too.
 ///
 /// Data-path frames are dispatched concurrently, up to `MAX_INFLIGHT` at
-/// once (PLAN_PERF1): each gets its own spawned task holding one permit from
+/// once: each gets its own spawned task holding one permit from
 /// `inflight`, so the reader can read and admit the next frame without
 /// waiting for the previous one's response. A frame classified by
 /// `dispatch::frame_must_be_serialized` (NEGOTIATE, SESSION_SETUP, LOGOFF,
@@ -269,7 +269,7 @@ pub async fn reader_task(
     result
 }
 
-// ── PLAN_PERF1 Step 8 — concurrent reader loop tests ────────────────────────
+// ── concurrent reader loop tests ────────────────────────────────────────────
 //
 // Every test drives the real `reader_task` over a real loopback TCP pair
 // (`reader_task`'s signature is hard-wired to `ReadHalf<TcpStream>`), but

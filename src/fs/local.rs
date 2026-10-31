@@ -1010,7 +1010,7 @@ mod tests {
         );
     }
 
-    // ── Step 3 (`docs/PLAN_smb_round_two.md`) — `ReplaceIfExists` matrix ───
+    // ── `ReplaceIfExists` matrix ───────────────────────────────────────────
 
     #[tokio::test]
     async fn replace_true_replaces_existing_file_atomically() {
