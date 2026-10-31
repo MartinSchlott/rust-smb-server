@@ -82,8 +82,10 @@ pub struct Connection {
 }
 
 /// A request answered `STATUS_PENDING` whose final response is still owed.
-/// Whoever removes it from the table sends that response: the waiting task
-/// when its work is done, or CANCEL / CLOSE by sending the status down `done`.
+/// The waiter task always owes that response. Removing the entry never
+/// transfers or cancels the obligation; it only means no CANCEL or close
+/// status will arrive, and a status sent down `done` is one input to the
+/// final the waiter still sends.
 pub(crate) struct Pending {
     pub(crate) message_id: u64,
     /// `Open::lock_owner` of the open the request waits on.
@@ -206,8 +208,10 @@ impl Connection {
         Ok(())
     }
 
-    /// Claim the right to send `async_id`'s final response.
-    pub fn take_pending(&self, async_id: u64) -> bool {
+    /// Remove `async_id`'s entry, recording that no CANCEL or close status
+    /// will arrive. Returns whether one was still registered. The waiter
+    /// always owns the final response either way.
+    pub(crate) fn take_pending(&self, async_id: u64) -> bool {
         self.pending().remove(&async_id).is_some()
     }
 
@@ -387,9 +391,17 @@ impl Connection {
 async fn close_session_state(conn: &Connection, sess_arc: &Arc<RwLock<Session>>) {
     let sess = sess_arc.write().await;
     let trees: Vec<_> = sess.trees.write().await.drain().collect();
+
+    // Close every drained open's lock owner and pending requests across ALL
+    // trees before the first backend close awaits. A backend that panics,
+    // stalls or is cancelled while closing a handle can therefore only strand
+    // handle-close work; no lock or waiter of this removed session is lost.
+    let mut handles = Vec::new();
     for (_tree_id, tree_arc) in trees {
-        close_tree_state(conn, &tree_arc).await;
+        let tree = tree_arc.write().await;
+        handles.extend(drain_tree_opens(conn, &tree).await);
     }
+    close_handles(handles).await;
 }
 
 async fn remove_tree_from_session(
@@ -412,13 +424,31 @@ async fn remove_tree_from_session(
 
 async fn close_tree_state(conn: &Connection, tree_arc: &Arc<RwLock<TreeConnect>>) {
     let tree = tree_arc.write().await;
+    let handles = drain_tree_opens(conn, &tree).await;
+    close_handles(handles).await;
+}
+
+/// Drains `tree`'s opens, closing every owner's locks and pending requests
+/// first, and returns the handles for a later best-effort close. The lock
+/// work is synchronous and complete before the caller awaits any backend.
+async fn drain_tree_opens(conn: &Connection, tree: &TreeConnect) -> Vec<Box<dyn Handle>> {
     let opens: Vec<_> = tree.opens.write().await.drain().collect();
+    let mut handles = Vec::with_capacity(opens.len());
     for (_fid, open_arc) in opens {
         let mut open = open_arc.write().await;
         conn.open_closed(&tree.share, &open.lock_owner);
         if let Some(handle) = open.handle.take() {
-            let _ = handle.close().await;
+            handles.push(handle);
         }
+    }
+    handles
+}
+
+/// Best-effort backend closes. A panic here unwinds only this loop: every
+/// owner's locks and pending requests were already completed by the drain.
+async fn close_handles(handles: Vec<Box<dyn Handle>>) {
+    for handle in handles {
+        let _ = handle.close().await;
     }
 }
 

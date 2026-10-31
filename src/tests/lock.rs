@@ -13,10 +13,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
-use crate::backend::{BackendCapabilities, Handle, OpenOptions, ShareBackend};
+use crate::backend::{
+    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenOptions, ShareBackend,
+};
 use crate::builder::Access;
 use crate::conn::state::{Connection, Open, Pending, Session, TreeConnect};
-use crate::conn::writer::{FramePayload, WRITER_CHANNEL, writer_task};
 use crate::dispatch::{
     AsyncWait, FrameOutcome, HandlerResponse, Held, WaitOutcome, dispatch_frame,
 };
@@ -850,10 +851,15 @@ async fn lock_keys_follow_the_backends_case_sensitivity() {
 
 // ── connection end over loopback TCP ───────────────────────────────────────
 
+enum Recv {
+    Frame(Smb2Header, Vec<u8>),
+    Eof,
+    Silent,
+}
+
 struct Wire {
     client: Option<TcpStream>,
-    frames: Option<mpsc::Receiver<Vec<u8>>>,
-    lifecycle: tokio::task::JoinHandle<()>,
+    lifecycle: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
 impl Wire {
@@ -864,29 +870,41 @@ impl Wire {
         client.write_all(&out).await.expect("write frame");
     }
 
-    async fn recv(&mut self) -> (Smb2Header, Vec<u8>) {
+    async fn recv_within(&mut self, within: Duration) -> Recv {
         let client = self.client.as_mut().expect("client");
-        let mut hdr = [0u8; FRAME_HEADER_LEN];
-        client.read_exact(&mut hdr).await.expect("frame header");
-        let len = decode_frame_header(&hdr).expect("frame length");
-        let mut payload = vec![0u8; len as usize];
-        client.read_exact(&mut payload).await.expect("frame body");
-        {
-            let (hdr, body) = Smb2Header::parse(&payload).expect("parse frame");
-            (hdr, body.to_vec())
+        let read = async {
+            let mut hdr = [0u8; FRAME_HEADER_LEN];
+            if client.read_exact(&mut hdr).await.is_err() {
+                return None;
+            }
+            let len = decode_frame_header(&hdr).ok()?;
+            let mut payload = vec![0u8; len as usize];
+            client.read_exact(&mut payload).await.ok()?;
+            Some(payload)
+        };
+        match tokio::time::timeout(within, read).await {
+            Err(_) => Recv::Silent,
+            Ok(None) => Recv::Eof,
+            Ok(Some(payload)) => {
+                let (hdr, body) = Smb2Header::parse(&payload).expect("parse frame");
+                Recv::Frame(hdr, body.to_vec())
+            }
         }
     }
 
-    async fn next_queued(&mut self) -> (Smb2Header, Vec<u8>) {
-        let frames = self.frames.as_mut().expect("queued frames");
-        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
-            .await
-            .expect("a frame")
-            .expect("writer open");
-        {
-            let (hdr, body) = Smb2Header::parse(&frame).expect("parse frame");
-            (hdr, body.to_vec())
+    async fn recv(&mut self) -> (Smb2Header, Vec<u8>) {
+        match self.recv_within(Duration::from_secs(5)).await {
+            Recv::Frame(hdr, body) => (hdr, body),
+            Recv::Eof => panic!("the connection closed instead of answering"),
+            Recv::Silent => panic!("no frame arrived"),
         }
+    }
+
+    /// Closes only the client's write half, so the server's reader sees EOF
+    /// while this side can still observe whether a final response is written.
+    async fn shutdown_write(&mut self) {
+        let client = self.client.as_mut().expect("client");
+        client.shutdown().await.expect("shutdown client write");
     }
 
     fn drop_client(&mut self) {
@@ -894,7 +912,10 @@ impl Wire {
     }
 
     async fn wait(&mut self) {
-        (&mut self.lifecycle).await.expect("lifecycle");
+        (&mut self.lifecycle)
+            .await
+            .expect("lifecycle")
+            .expect("connection");
     }
 }
 
@@ -903,7 +924,6 @@ async fn spawn_wire(
     share: &Arc<ShareBindings>,
     backend: &Arc<dyn ShareBackend>,
     names: &[&str],
-    with_writer: bool,
 ) -> (Wire, Vec<FileId>, Vec<u64>) {
     let server = smb.state();
     let (conn, _session_id, _tree_id, file_ids, owners) =
@@ -914,38 +934,16 @@ async fn spawn_wire(
     let server_side = accepted.expect("accept").0;
     let client = connected.expect("connect");
     let (read_half, write_half) = tokio::io::split(server_side);
-    let (tx, rx) = mpsc::channel::<FramePayload>(WRITER_CHANNEL);
-    *conn.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
 
-    let (writer, frames) = if with_writer {
-        (
-            Some(tokio::spawn(writer_task(
-                write_half,
-                rx,
-                conn.subscribe_close(),
-            ))),
-            None,
-        )
-    } else {
-        drop(write_half);
-        // The same channel the writer would drain, kept for inspection.
-        (None, Some(rx))
-    };
-
-    let conn_for_task = conn.clone();
-    let lifecycle = tokio::spawn(async move {
-        let _ =
-            crate::conn::reader::reader_task(read_half, server, conn_for_task.clone(), tx).await;
-        conn_for_task.teardown().await;
-        if let Some(writer) = writer {
-            let _ = writer.await;
-        }
-    });
+    // The real production lifecycle, not a copied one: connection_loop is
+    // this helper plus registration.
+    let lifecycle = tokio::spawn(crate::conn::serve_connection(
+        read_half, write_half, server, conn,
+    ));
 
     (
         Wire {
             client: Some(client),
-            frames,
             lifecycle,
         },
         file_ids,
@@ -960,7 +958,7 @@ async fn dropping_a_connection_releases_its_locks() {
     let share = make_share(backend.clone());
     let smb = make_server(share.clone(), Duration::from_secs(60), None);
 
-    let (mut first, first_ids, _) = spawn_wire(&smb, &share, &backend, &["db"], true).await;
+    let (mut first, first_ids, _) = spawn_wire(&smb, &share, &backend, &["db"]).await;
     let mut hdr = header(1, 1, Command::Lock);
     hdr.message_id = 1;
     first
@@ -975,7 +973,7 @@ async fn dropping_a_connection_releases_its_locks() {
     first.drop_client();
     first.wait().await;
 
-    let (mut second, second_ids, _) = spawn_wire(&smb, &share, &backend, &["db"], true).await;
+    let (mut second, second_ids, _) = spawn_wire(&smb, &share, &backend, &["db"]).await;
     let mut hdr = header(1, 1, Command::Lock);
     hdr.message_id = 1;
     second
@@ -997,7 +995,7 @@ async fn a_waiter_granted_during_teardown_writes_no_final() {
     let share = make_share(backend.clone());
     let smb = make_server(share.clone(), Duration::from_secs(60), None);
 
-    let (mut holder, holder_ids, _) = spawn_wire(&smb, &share, &backend, &["db"], true).await;
+    let (mut holder, holder_ids, _) = spawn_wire(&smb, &share, &backend, &["db"]).await;
     let mut hdr = header(1, 1, Command::Lock);
     hdr.message_id = 1;
     holder
@@ -1011,17 +1009,17 @@ async fn a_waiter_granted_during_teardown_writes_no_final() {
         ntstatus::STATUS_SUCCESS
     );
 
-    let (mut waiter, waiter_ids, waiter_owners) =
-        spawn_wire(&smb, &share, &backend, &["db"], false).await;
+    let (mut waiter, waiter_ids, waiter_owners) = spawn_wire(&smb, &share, &backend, &["db"]).await;
     let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
     let (_guard, hook) = crate::tests::pause::hold_waiter(waiter_owners[0], entered_tx);
+    let (_done_guard, mut done_rx) = crate::tests::pause::waiter_done_hook(waiter_owners[0]);
     let mut hdr = header(1, 1, Command::Lock);
     hdr.message_id = 2;
     waiter
         .send(&frame_payload(&hdr, &lock_body(waiter_ids[0], 5, 1, EX)))
         .await;
     assert_eq!(
-        waiter.next_queued().await.0.channel_sequence_status,
+        waiter.recv().await.0.channel_sequence_status,
         ntstatus::STATUS_PENDING
     );
 
@@ -1030,20 +1028,23 @@ async fn a_waiter_granted_during_teardown_writes_no_final() {
     holder.wait().await;
     entered_rx.recv().await.expect("waiter reached the pause");
 
-    // The client dies before the waiter resumes; the connection loop's
-    // teardown runs with it.
-    waiter.drop_client();
+    // The client's write side closes before the waiter resumes; the real
+    // connection lifecycle runs teardown with it.
+    waiter.shutdown_write().await;
     waiter.wait().await;
 
     hook.resume();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut frames = waiter.frames.take().expect("frames");
-    assert!(
-        frames.try_recv().is_err(),
-        "no final is queued for the dead connection"
-    );
+    done_rx.recv().await.expect("the waiter task finished");
+    match waiter.recv_within(Duration::from_millis(500)).await {
+        Recv::Eof => {}
+        Recv::Frame(hdr, _) => panic!(
+            "a final response was written to the dead connection: status 0x{:08X}",
+            hdr.channel_sequence_status
+        ),
+        Recv::Silent => panic!("the server left the half-closed socket open"),
+    }
 
-    let (mut second, second_ids, _) = spawn_wire(&smb, &share, &backend, &["db"], true).await;
+    let (mut second, second_ids, _) = spawn_wire(&smb, &share, &backend, &["db"]).await;
     let mut hdr = header(1, 1, Command::Lock);
     hdr.message_id = 1;
     second
@@ -1070,14 +1071,6 @@ struct CaptureIncident {
 impl IncidentSink for CaptureIncident {
     fn record(&self, incident: &Incident) {
         self.events.lock().unwrap().push(incident.clone());
-    }
-}
-
-struct PanicKeep;
-
-impl Held for PanicKeep {
-    fn keep(self: Box<Self>) {
-        panic!("the final response glue panicked");
     }
 }
 
@@ -1110,6 +1103,7 @@ async fn a_panicking_work_answers_internal_error_and_frees_nothing() {
     )
     .await;
     let owner = LockOwner::new();
+    let (_done_guard, mut done_rx) = crate::tests::pause::waiter_done_hook(owner.id());
     let work: Pin<Box<dyn Future<Output = WaitOutcome> + Send>> = Box::pin(async {
         panic!("work panicked");
     });
@@ -1128,6 +1122,7 @@ async fn a_panicking_work_answers_internal_error_and_frees_nothing() {
         (final_hdr.channel_sequence_status, final_hdr.async_id()),
         (ntstatus::STATUS_INTERNAL_ERROR, Some(async_id))
     );
+    done_rx.recv().await.expect("the waiter task finished");
     rig.no_frame().await;
     let events = sink.events.lock().unwrap();
     assert!(
@@ -1144,6 +1139,7 @@ async fn a_panic_after_the_grant_was_claimed_frees_the_range() {
     let mut rig = Rig::new(MemFsBackend::new().with_file("db", b"0123456789")).await;
     let owner = LockOwner::new();
     let _panic = crate::tests::pause::panic_after_claim(owner.id());
+    let (_done_guard, mut done_rx) = crate::tests::pause::waiter_done_hook(owner.id());
     let grant = rig
         .share
         .locks
@@ -1165,6 +1161,7 @@ async fn a_panic_after_the_grant_was_claimed_frees_the_range() {
         (final_hdr.channel_sequence_status, final_hdr.async_id()),
         (ntstatus::STATUS_INTERNAL_ERROR, Some(async_id))
     );
+    done_rx.recv().await.expect("the waiter task finished");
     rig.no_frame().await;
 
     let fresh = LockOwner::new();
@@ -1180,6 +1177,7 @@ async fn a_panic_after_the_grant_was_claimed_frees_the_range() {
 async fn a_taken_writer_slot_rolls_a_grant_back_without_a_final() {
     let mut rig = Rig::new(MemFsBackend::new().with_file("db", b"0123456789")).await;
     let owner = LockOwner::new();
+    let (_done_guard, mut done_rx) = crate::tests::pause::waiter_done_hook(owner.id());
     let grant = rig
         .share
         .locks
@@ -1200,7 +1198,7 @@ async fn a_taken_writer_slot_rolls_a_grant_back_without_a_final() {
         .take();
     synthetic(&rig, wait).await;
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    done_rx.recv().await.expect("the waiter task finished");
     assert!(rig.frames.try_recv().is_err(), "no final was written");
     let fresh = LockOwner::new();
     assert!(
@@ -1213,13 +1211,19 @@ async fn a_taken_writer_slot_rolls_a_grant_back_without_a_final() {
 
 #[tokio::test]
 async fn a_panic_after_cancel_answers_cancelled() {
-    let mut rig = Rig::new(MemFsBackend::new().with_file("db", b"0123456789")).await;
+    let sink = Arc::new(CaptureIncident::default());
+    let mut rig = Rig::with(
+        Arc::new(MemFsBackend::new().with_file("db", b"0123456789")),
+        Duration::from_secs(60),
+        Some(sink.clone()),
+    )
+    .await;
     let owner = LockOwner::new();
-    let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
-    let work: Pin<Box<dyn Future<Output = WaitOutcome> + Send>> = Box::pin(async move {
-        let _ = wait_for_release.await;
-        panic!("late panic");
-    });
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let (_pause_guard, hook) = crate::tests::pause::hold_before_select(owner.id(), entered_tx);
+    let (_done_guard, mut done_rx) = crate::tests::pause::waiter_done_hook(owner.id());
+    let work: Pin<Box<dyn Future<Output = WaitOutcome> + Send>> =
+        Box::pin(async { panic!("late panic") });
     let wait = AsyncWait {
         owner,
         on_close: ntstatus::STATUS_RANGE_NOT_LOCKED,
@@ -1229,8 +1233,14 @@ async fn a_panic_after_cancel_answers_cancelled() {
     synthetic(&rig, wait).await;
     let (interim, _) = rig.next_frame().await;
     let async_id = interim.async_id().unwrap();
+
+    // The waiter is parked before its race. Deliver the cancellation first,
+    // then let it resume, so the work panic happens with CANCELLED already
+    // waiting — not as a random select tie.
+    entered_rx.recv().await.expect("waiter reached the pause");
     rig.conn.cancel(Some(async_id), 0);
-    let _ = release.send(());
+    hook.resume();
+    done_rx.recv().await.expect("the waiter task finished");
 
     let (final_hdr, _) = rig.next_frame().await;
     assert_eq!(
@@ -1238,29 +1248,279 @@ async fn a_panic_after_cancel_answers_cancelled() {
         (ntstatus::STATUS_CANCELLED, Some(async_id))
     );
     rig.no_frame().await;
+    let events = sink.events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|i| matches!(i.kind, crate::incident::IncidentKind::Panicked { .. })),
+        "the panic incident is reported even though the final is CANCELLED"
+    );
+    assert_eq!(events[0].message_id, Some(500));
 }
 
 #[tokio::test]
-async fn a_panic_in_the_response_glue_closes_the_connection() {
+async fn a_panic_before_the_final_is_queued_closes_and_rolls_back() {
     let mut rig = Rig::new(MemFsBackend::new().with_file("db", b"0123456789")).await;
     let owner = LockOwner::new();
+    let _panic = crate::tests::pause::panic_before_final(owner.id());
+    let (_done_guard, mut done_rx) = crate::tests::pause::waiter_done_hook(owner.id());
+    let grant = rig
+        .share
+        .locks
+        .lock_wait("db", owner.clone(), Range::new(0, 10, true).unwrap())
+        .await
+        .expect("granted");
     let wait = AsyncWait {
         owner,
         on_close: ntstatus::STATUS_RANGE_NOT_LOCKED,
         refused: ntstatus::STATUS_LOCK_NOT_GRANTED,
-        work: work_granted(Box::new(PanicKeep)),
+        work: work_granted(Box::new(grant)),
     };
     synthetic(&rig, wait).await;
     let (interim, _) = rig.next_frame().await;
-    let async_id = interim.async_id().unwrap();
-    let (final_hdr, _) = rig.next_frame().await;
-    assert_eq!(
-        (final_hdr.channel_sequence_status, final_hdr.async_id()),
-        (ntstatus::STATUS_SUCCESS, Some(async_id))
+    assert_eq!(interim.channel_sequence_status, ntstatus::STATUS_PENDING);
+
+    done_rx.recv().await.expect("the waiter task finished");
+    assert!(
+        rig.frames.try_recv().is_err(),
+        "the grant's final was never queued"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         *rig.conn.subscribe_close().borrow(),
         "a panicking response glue closes the connection"
     );
+    let fresh = LockOwner::new();
+    assert!(
+        rig.share
+            .locks
+            .try_lock("db", &fresh, &[Range::new(0, 10, true).unwrap()])
+            .is_ok(),
+        "the armed grant rolled back"
+    );
+}
+
+// ── lifecycle cleanup with a failing backend close ─────────────────────────
+
+enum CloseMode {
+    Panic,
+    Stall(mpsc::UnboundedSender<()>),
+}
+
+struct TestHandle {
+    mode: CloseMode,
+}
+
+#[async_trait]
+impl Handle for TestHandle {
+    async fn read(&self, _offset: u64, _len: u32) -> SmbResult<bytes::Bytes> {
+        Ok(bytes::Bytes::new())
+    }
+    async fn write(&self, _offset: u64, data: &[u8]) -> SmbResult<u32> {
+        Ok(data.len() as u32)
+    }
+    async fn flush(&self) -> SmbResult<()> {
+        Ok(())
+    }
+    async fn stat(&self) -> SmbResult<FileInfo> {
+        Ok(FileInfo {
+            name: "test".to_owned(),
+            end_of_file: 0,
+            allocation_size: 0,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            is_directory: false,
+            is_symlink: false,
+            file_index: 0,
+        })
+    }
+    async fn set_times(&self, _times: FileTimes) -> SmbResult<()> {
+        Ok(())
+    }
+    async fn truncate(&self, _len: u64) -> SmbResult<()> {
+        Ok(())
+    }
+    async fn list_dir(&self, _pattern: Option<&str>) -> SmbResult<Vec<DirEntry>> {
+        Ok(Vec::new())
+    }
+    async fn close(self: Box<Self>) -> SmbResult<()> {
+        match self.mode {
+            CloseMode::Panic => panic!("injected backend close panic"),
+            CloseMode::Stall(entered) => {
+                let _ = entered.send(());
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn install_open(tree: &TreeConnect, path: &str, mode: CloseMode) -> Arc<LockOwner> {
+    let file_id = tree.alloc_file_id();
+    let open = Open::new(
+        file_id,
+        Box::new(TestHandle { mode }),
+        Access::ReadWrite,
+        path.parse().expect("path"),
+        false,
+        false,
+    );
+    let owner = open.lock_owner.clone();
+    tree.opens
+        .write()
+        .await
+        .insert(file_id, Arc::new(RwLock::new(open)));
+    owner
+}
+
+/// Two trees in one session, each with a locked open plus one waiting open.
+/// Returns the connection, every locked path, and the waiters' done channels.
+async fn session_with_failing_closes(
+    share: &Arc<ShareBindings>,
+    stall: Option<mpsc::UnboundedSender<()>>,
+) -> (
+    Arc<Connection>,
+    Vec<&'static str>,
+    Vec<tokio::sync::oneshot::Receiver<u32>>,
+) {
+    let conn = Arc::new(Connection::new(1, Uuid::nil(), 1 << 20, 1 << 20));
+    let session = Arc::new(RwLock::new(Session::new(
+        1,
+        Identity::Anonymous,
+        [0; 16],
+        [0; 16],
+        false,
+        None,
+    )));
+
+    let tree1 = TreeConnect::new(1, share.clone(), Access::ReadWrite);
+    let tree2 = TreeConnect::new(2, share.clone(), Access::ReadWrite);
+    let modes = || match &stall {
+        Some(tx) => CloseMode::Stall(tx.clone()),
+        None => CloseMode::Panic,
+    };
+
+    // Tree 1: "a" held, "b" waiting.
+    let a = install_open(&tree1, "a", modes()).await;
+    share
+        .locks
+        .try_lock("a", &a, &[Range::new(0, 10, true).unwrap()])
+        .unwrap();
+    let b = install_open(&tree1, "b", modes()).await;
+    let (done_b, wait_b) = tokio::sync::oneshot::channel();
+    conn.register_pending(
+        1,
+        Pending {
+            message_id: 1,
+            owner: b,
+            on_close: ntstatus::STATUS_RANGE_NOT_LOCKED,
+            done: done_b,
+        },
+    )
+    .map_err(|_| ())
+    .expect("registered");
+    // Tree 2: "c" held, "d" waiting.
+    let c = install_open(&tree2, "c", modes()).await;
+    share
+        .locks
+        .try_lock("c", &c, &[Range::new(0, 10, true).unwrap()])
+        .unwrap();
+    let d = install_open(&tree2, "d", modes()).await;
+    let (done_d, wait_d) = tokio::sync::oneshot::channel();
+    conn.register_pending(
+        2,
+        Pending {
+            message_id: 2,
+            owner: d,
+            on_close: ntstatus::STATUS_RANGE_NOT_LOCKED,
+            done: done_d,
+        },
+    )
+    .map_err(|_| ())
+    .expect("registered");
+
+    session
+        .read()
+        .await
+        .trees
+        .write()
+        .await
+        .insert(1, Arc::new(RwLock::new(tree1)));
+    session
+        .read()
+        .await
+        .trees
+        .write()
+        .await
+        .insert(2, Arc::new(RwLock::new(tree2)));
+    conn.sessions.write().await.insert(1, session);
+
+    (conn, vec!["a", "c"], vec![wait_b, wait_d])
+}
+
+#[tokio::test]
+async fn a_panicking_backend_close_releases_every_tree_and_waiter() {
+    let share = make_share(Arc::new(MemFsBackend::new()));
+    let (conn, locked, mut waiters) = session_with_failing_closes(&share, None).await;
+
+    let closer = tokio::spawn({
+        let conn = conn.clone();
+        async move { conn.close_session(1).await }
+    });
+    let joined = closer.await;
+    assert!(joined.is_err(), "the injected backend close panicked");
+
+    for waiter in waiters.iter_mut() {
+        assert_eq!(
+            waiter.await.expect("on_close"),
+            ntstatus::STATUS_RANGE_NOT_LOCKED,
+            "no waiter of the removed session stays pending"
+        );
+    }
+    let fresh = LockOwner::new();
+    for path in locked {
+        assert!(
+            share
+                .locks
+                .try_lock(path, &fresh, &[Range::new(0, 10, true).unwrap()])
+                .is_ok(),
+            "a fresh connection can acquire {path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_backend_close_cancelled_before_it_finishes_releases_every_tree_and_waiter() {
+    let share = make_share(Arc::new(MemFsBackend::new()));
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let (conn, locked, mut waiters) = session_with_failing_closes(&share, Some(entered_tx)).await;
+
+    let closer = tokio::spawn({
+        let conn = conn.clone();
+        async move { conn.close_session(1).await }
+    });
+    // The first backend close has started, so every tree's lock cleanup is
+    // already done before the await.
+    entered_rx.recv().await.expect("a backend close started");
+    closer.abort();
+    let _ = closer.await;
+
+    for waiter in waiters.iter_mut() {
+        assert_eq!(
+            waiter.await.expect("on_close"),
+            ntstatus::STATUS_RANGE_NOT_LOCKED,
+            "no waiter of the removed session stays pending"
+        );
+    }
+    let fresh = LockOwner::new();
+    for path in locked {
+        assert!(
+            share
+                .locks
+                .try_lock(path, &fresh, &[Range::new(0, 10, true).unwrap()])
+                .is_ok(),
+            "a fresh connection can acquire {path}"
+        );
+    }
 }

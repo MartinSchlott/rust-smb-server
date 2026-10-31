@@ -1136,6 +1136,9 @@ fn spawn_async_waiter(
         trace_key,
         async_id,
     } = request;
+    let owner_id = wait.owner.id();
+    #[cfg(not(test))]
+    let _ = owner_id;
     tokio::spawn(crate::trace::scoped(trace_key, async move {
         let outcome = crate::supervise::catch_future_unwind(waiter_inner(
             &server,
@@ -1163,6 +1166,8 @@ fn spawn_async_waiter(
                         trace_key,
                         crate::trace::TraceEvent::Response { status },
                     );
+                    #[cfg(test)]
+                    crate::tests::pause::before_final(owner_id);
                     let accepted = conn.send(bytes).await;
                     if accepted {
                         if let Some(held) = held {
@@ -1219,6 +1224,8 @@ fn spawn_async_waiter(
                         trace_key,
                         crate::trace::TraceEvent::Response { status },
                     );
+                    #[cfg(test)]
+                    crate::tests::pause::before_final(owner_id);
                     conn.send(bytes).await;
                 };
                 if let Err(payload) = crate::supervise::catch_future_unwind(glue).await {
@@ -1226,6 +1233,8 @@ fn spawn_async_waiter(
                 }
             }
         }
+        #[cfg(test)]
+        crate::tests::pause::waiter_done(owner_id);
     }));
 }
 
@@ -1263,12 +1272,15 @@ async fn waiter_inner(
     );
     conn.send(interim).await;
 
+    #[cfg(test)]
+    crate::tests::pause::before_select(_owner.id()).await;
+
+    // When a status and the grant are both ready, the grant path runs
+    // first: it discovers the cancelled/closed pending entry, gives the
+    // range back, and still finishes with the delivered status. This makes
+    // the rollback deterministic instead of leaving it to a random tie.
     tokio::select! {
-        status = &mut *done_rx => match status {
-            Ok(status) => Some((HandlerResponse::err(status), None)),
-            // Teardown dropped the entry: the connection has ended.
-            Err(_) => None,
-        },
+        biased;
         outcome = &mut work => match outcome {
             WaitOutcome::Granted { resp, held } => {
                 #[cfg(test)]
@@ -1299,6 +1311,11 @@ async fn waiter_inner(
                 Err(_) => None,
                 }
             }
+        },
+        status = &mut *done_rx => match status {
+            Ok(status) => Some((HandlerResponse::err(status), None)),
+            // Teardown dropped the entry: the connection has ended.
+            Err(_) => None,
         },
     }
 }
