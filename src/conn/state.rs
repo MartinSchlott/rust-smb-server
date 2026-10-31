@@ -425,6 +425,8 @@ async fn remove_tree_from_session(
 async fn close_tree_state(conn: &Connection, tree_arc: &Arc<RwLock<TreeConnect>>) {
     let tree = tree_arc.write().await;
     let handles = drain_tree_opens(conn, &tree).await;
+    // Owners are closed; no backend close should hold the removed tree's lock.
+    drop(tree);
     close_handles(handles).await;
 }
 
